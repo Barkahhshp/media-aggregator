@@ -169,7 +169,7 @@ describe("source management API", () => {
     expect(await testEnv.DB.prepare("SELECT id FROM sources WHERE url = 'https://example.com/export-race-feed'").first()).toBeNull();
   });
 
-  it("blocks_source_configuration_edits_but_allows_disable_and_delete_during_export", async () => {
+  it("blocks_all_source_mutations_during_export", async () => {
     const app = await loadApp();
     if (!app) return;
     const created = await sourceRequest(app, "/v1/sources", "POST", {
@@ -184,10 +184,10 @@ describe("source management API", () => {
     const disabled = await sourceRequest(app, `/v1/sources/${source.source.id}`, "DELETE");
 
     expect(patched.status).toBe(423);
-    expect(disabledPatch.status).toBe(200);
-    expect(disabled.status).toBe(200);
+    expect(disabledPatch.status).toBe(423);
+    expect(disabled.status).toBe(423);
     expect(await testEnv.DB.prepare("SELECT enabled, poll_interval_sec FROM sources WHERE id = ?").bind(source.source.id).first())
-      .toMatchObject({ enabled: 0, poll_interval_sec: 7200 });
+      .toMatchObject({ enabled: 1, poll_interval_sec: 7200 });
   });
 
   it("allows_source_disable_while_physical_storage_is_limited", async () => {

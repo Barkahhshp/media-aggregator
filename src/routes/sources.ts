@@ -142,12 +142,24 @@ sources.patch("/v1/sources/:id", async (context) => {
   const disableOnly = update.enabled === false
     && update.poll_interval_sec === undefined
     && update.selectors === undefined;
+  const now = Math.floor(Date.now() / 1000);
+  const exportLock = await context.env.DB.prepare(
+    "SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'",
+  ).first<{ export_lock: number; export_lock_expires_at: number | null }>();
+  if (exportLock?.export_lock === 1 && (exportLock.export_lock_expires_at ?? 0) > now) {
+    return apiErrorResponse({ status: 423, code: "export_in_progress", message: "Source changes are paused during export" }, context.req.raw);
+  }
   if (disableOnly) {
-    const source = await disableSource(context.env.DB, current.id);
-    if (source === null) {
-      return apiErrorResponse({ status: 404, code: "source_not_found", message: "Source not found" }, context.req.raw);
+    try {
+      const source = await disableSource(context.env.DB, current.id);
+      if (source === null) {
+        return apiErrorResponse({ status: 404, code: "source_not_found", message: "Source not found" }, context.req.raw);
+      }
+      return context.json({ source });
+    } catch (error) {
+      if (error instanceof SourceRepositoryError) return repositoryErrorResponse(error, context.req.raw);
+      throw error;
     }
-    return context.json({ source });
   }
   const candidate = validateSourceInput({
     kind: current.kind,
@@ -157,13 +169,6 @@ sources.patch("/v1/sources/:id", async (context) => {
   });
   if (isApiError(candidate)) return apiErrorResponse(candidate, context.req.raw);
 
-  const now = Math.floor(Date.now() / 1000);
-  const exportLock = await context.env.DB.prepare(
-    "SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'",
-  ).first<{ export_lock: number; export_lock_expires_at: number | null }>();
-  if (!disableOnly && exportLock?.export_lock === 1 && (exportLock.export_lock_expires_at ?? 0) > now) {
-    return apiErrorResponse({ status: 423, code: "export_in_progress", message: "Source changes are paused during export" }, context.req.raw);
-  }
   let reservation: WriteReservation | null = null;
   if (!disableOnly) {
     const updateBytes = new TextEncoder().encode(JSON.stringify(candidate)).byteLength;
@@ -175,7 +180,7 @@ sources.patch("/v1/sources/:id", async (context) => {
   }
   let measuredSize = reservation?.measuredSize ?? 0;
   try {
-    const source = await updateSource(context.env.DB, current.id, candidate, update.enabled, disableOnly);
+    const source = await updateSource(context.env.DB, current.id, candidate, update.enabled);
     if (source === null) {
       return apiErrorResponse({ status: 404, code: "source_not_found", message: "Source not found" }, context.req.raw);
     }
@@ -191,9 +196,14 @@ sources.patch("/v1/sources/:id", async (context) => {
 });
 
 sources.delete("/v1/sources/:id", async (context) => {
-  const source = await disableSource(context.env.DB, context.req.param("id"));
-  if (source === null) {
-    return apiErrorResponse({ status: 404, code: "source_not_found", message: "Source not found" }, context.req.raw);
+  try {
+    const source = await disableSource(context.env.DB, context.req.param("id"));
+    if (source === null) {
+      return apiErrorResponse({ status: 404, code: "source_not_found", message: "Source not found" }, context.req.raw);
+    }
+    return context.json({ source });
+  } catch (error) {
+    if (error instanceof SourceRepositoryError) return repositoryErrorResponse(error, context.req.raw);
+    throw error;
   }
-  return context.json({ source });
 });
