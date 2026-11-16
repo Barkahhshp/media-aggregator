@@ -72,3 +72,49 @@ A follow-up `wrangler d1 execute ... --local` query returned `sources=1`, `pendi
 ## Deployment and commit
 
 No Cloudflare account resource was created and nothing was deployed. The requested commit message is `feat: add consistent export and recovery guide`.
+
+
+## Fix round 1/5 — export read budget
+
+### RED evidence
+
+Before the production change, ran:
+
+```text
+npm test -- tests/exports-api.test.ts -t "keeps_a_10,000_record_export_below_the_daily_read_quota_without_recounting_tables"
+```
+
+The 10,000-record API walk completed 1,112 pages, then failed the budget assertion: `meta.rows_read` was **11,136,680**, above the 5,000,000 daily limit. The same pre-fix regression also observed **1,112** count-query statements where the session contract requires one.
+
+### Change
+
+Added migration `0002_export_snapshot_counts.sql` for three persisted counts on `export_sessions`; active sessions present during migration are backfilled once. `startExport` captures all three counts in the same D1 batch that holds the export lock and creates the session. `getExportSession` returns those cached counts and `getExportPage` reuses them for each manifest instead of rescanning the tables. The page record/byte caps and stable export lock behavior are unchanged.
+
+### GREEN evidence
+
+Reran the focused regression after implementation. Observed **26,682 `meta.rows_read`**, **1** count-query statement, **1,112** pages, and all **10,000** records exported; every page also asserts the exact manifest counts (`1` source, `4,999` pending items, `5,000` articles). The regression fails if D1 omits `meta.rows_read`.
+
+### Final verification
+
+```text
+npm test
+Test Files 22 passed (22)
+Tests 206 passed (206)
+
+npm run lint
+Passed (exit 0).
+
+npm run typecheck
+Passed (exit 0).
+
+npm run build
+Wrangler dry-run passed; Total Upload: 292.84 KiB / gzip: 63.81 KiB; --dry-run exited.
+
+npm audit
+found 0 vulnerabilities
+
+git diff --check
+Passed.
+```
+
+No deployment or Cloudflare account resource was created. The two Minor findings (private backup-file permissions and export-session retention) remain deferred to the final review, as requested.

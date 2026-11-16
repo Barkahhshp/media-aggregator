@@ -69,13 +69,14 @@ async function apiRequest(
   path: string,
   method = "GET",
   body?: unknown,
+  requestEnv: TestEnvironment = testEnv,
 ): Promise<Response> {
   const headers = new Headers({ Authorization: `Bearer ${testEnv.API_TOKEN}` });
   if (body !== undefined) headers.set("Content-Type", "application/json");
   return await app.request(
     path,
     { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) },
-    testEnv,
+    requestEnv,
   );
 }
 
@@ -142,6 +143,112 @@ async function seedArticle(id: string, sourceId: string, contentText: string): P
   ).run();
 }
 
+async function seedLargeExportSnapshot(): Promise<void> {
+  await seedSource("budget-source");
+  const batchSize = 50;
+  const pendingCount = 4_999;
+  for (let start = 0; start < pendingCount; start += batchSize) {
+    const statements: D1PreparedStatement[] = [];
+    for (let index = start; index < Math.min(start + batchSize, pendingCount); index += 1) {
+      const id = `budget-pending-${String(index).padStart(5, "0")}`;
+      statements.push(testEnv.DB.prepare(`
+        INSERT INTO pending_items (
+          id, source_id, item_type, dedupe_key, external_id, canonical_url, title, summary,
+          status, attempts, next_attempt_at, last_error, terminal_expires_at, discovered_at
+        ) VALUES (?, 'budget-source', 'article', ?, ?, ?, ?, 'Budget row', 'pending', 0,
+          1800000000, NULL, NULL, 1800000000)
+      `).bind(id, `dedupe-${id}`, `external-${id}`, `https://example.com/${id}`, `Pending ${id}`));
+    }
+    await testEnv.DB.batch(statements);
+  }
+
+  const articleCount = 5_000;
+  for (let start = 0; start < articleCount; start += batchSize) {
+    const statements: D1PreparedStatement[] = [];
+    for (let index = start; index < Math.min(start + batchSize, articleCount); index += 1) {
+      const id = `budget-article-${String(index).padStart(5, "0")}`;
+      statements.push(testEnv.DB.prepare(`
+        INSERT INTO articles (
+          id, source_id, canonical_url, title, summary, published_at, fetched_at,
+          content_text, content_hash, status
+        ) VALUES (?, 'budget-source', ?, ?, 'Budget row', '2026-11-16T12:00:00.000Z',
+          1800000000, 'x', ?, 'stored')
+      `).bind(id, `https://example.com/${id}`, `Article ${id}`, `sha256-${id}`));
+    }
+    await testEnv.DB.batch(statements);
+  }
+}
+
+function withReadBudgetTracking(db: D1Database): {
+  db: D1Database;
+  rowsRead(): number;
+  countStatements(): number;
+} {
+  let rowsRead = 0;
+  let countStatements = 0;
+  const originals = new WeakMap<object, D1PreparedStatement>();
+  const queryByStatement = new WeakMap<object, string>();
+  const record = (query: string, result: D1Result<unknown>): void => {
+    if (typeof result.meta.rows_read !== "number") {
+      throw new Error("D1 query result omitted meta.rows_read");
+    }
+    rowsRead += result.meta.rows_read;
+    if (/COUNT\s*\(\s*\*\s*\)/iu.test(query)) countStatements += 1;
+  };
+  const wrapStatement = (query: string, statement: D1PreparedStatement): D1PreparedStatement => {
+    const proxy = new Proxy(statement, {
+      get(target, property) {
+        if (property === "bind") {
+          return (...values: unknown[]) => wrapStatement(query, target.bind(...values));
+        }
+        if (property === "first") {
+          return async <T = unknown>(columnName?: string): Promise<T | null> => {
+            const result = await target.all<T>();
+            record(query, result as D1Result<unknown>);
+            const row = result.results?.[0] ?? null;
+            if (row === null || columnName === undefined) return row;
+            return ((row as Record<string, unknown>)[columnName] ?? null) as T | null;
+          };
+        }
+        if (property === "all" || property === "run") {
+          const method = Reflect.get(target, property, target) as (...args: unknown[]) => Promise<D1Result<unknown>>;
+          return async (...args: unknown[]) => {
+            const result = await method.apply(target, args);
+            record(query, result);
+            return result;
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    originals.set(proxy, statement);
+    queryByStatement.set(proxy, query);
+    return proxy;
+  };
+  const trackedDb = new Proxy(db, {
+    get(target, property) {
+      if (property === "prepare") {
+        return (query: string) => wrapStatement(query, target.prepare(query));
+      }
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          const result = await target.batch(statements.map((statement) => originals.get(statement as object) ?? statement));
+          statements.forEach((statement, index) => {
+            const query = queryByStatement.get(statement as object);
+            const statementResult = result[index];
+            if (query !== undefined && statementResult !== undefined) record(query, statementResult);
+          });
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as D1Database;
+  return { db: trackedDb, rowsRead: () => rowsRead, countStatements: () => countStatements };
+}
+
 function parsePage(text: string): { manifest: ExportManifest; records: ExportRecord[] } {
   const lines = text.trimEnd().split("\n");
   const parsed = lines.map((line) => JSON.parse(line) as ExportManifest | ExportRecord);
@@ -151,8 +258,11 @@ function parsePage(text: string): { manifest: ExportManifest; records: ExportRec
   };
 }
 
-async function startExport(app: NonNullable<Awaited<ReturnType<typeof loadApp>>>) {
-  const response = await apiRequest(app, "/v1/exports", "POST");
+async function startExport(
+  app: NonNullable<Awaited<ReturnType<typeof loadApp>>>,
+  requestEnv: TestEnvironment = testEnv,
+) {
+  const response = await apiRequest(app, "/v1/exports", "POST", undefined, requestEnv);
   expect(response.status).toBe(201);
   return (await response.json<{ session: ExportSession }>()).session;
 }
@@ -317,4 +427,39 @@ describe("consistent export API", () => {
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: { code: "invalid_export_cursor" } });
   });
+
+  it("keeps_a_10,000_record_export_below_the_daily_read_quota_without_recounting_tables", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    await seedLargeExportSnapshot();
+    const readBudget = withReadBudgetTracking(testEnv.DB);
+    const trackedEnv: TestEnvironment = { ...testEnv, DB: readBudget.db };
+    const session = await startExport(app, trackedEnv);
+
+    let cursor: string | null = null;
+    let pages = 0;
+    let exportedRecords = 0;
+    do {
+      const path = cursor === null
+        ? `/v1/exports/${session.id}`
+        : `/v1/exports/${session.id}?cursor=${encodeURIComponent(cursor)}`;
+      const response = await apiRequest(app, path, "GET", undefined, trackedEnv);
+      expect(response.status).toBe(200);
+      const text = new TextDecoder().decode(await response.arrayBuffer());
+      expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(3 * 1024 * 1024);
+      const { manifest, records } = parsePage(text);
+      expect(manifest.counts).toEqual({ sources: 1, pending_items: 4_999, articles: 5_000 });
+      expect(records.length + 1).toBeLessThanOrEqual(10);
+      exportedRecords += records.length;
+      pages += 1;
+      cursor = manifest.next_cursor;
+      expect(pages).toBeLessThanOrEqual(1_112);
+    } while (cursor !== null);
+
+    expect(exportedRecords).toBe(10_000);
+    expect(pages).toBe(1_112);
+    expect(readBudget.rowsRead()).toBeLessThan(5_000_000);
+    expect(readBudget.countStatements()).toBe(1);
+    await apiRequest(app, `/v1/exports/${session.id}`, "DELETE", undefined, trackedEnv);
+  }, 120_000);
 });

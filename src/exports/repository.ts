@@ -28,6 +28,7 @@ export interface ExportSession {
   state: "active" | "completed" | "expired";
   created_at: number;
   updated_at: number;
+  counts: ExportCounts;
 }
 
 export interface ExportRecord {
@@ -163,12 +164,18 @@ function sessionFromRow(row: Record<string, unknown> | null): ExportSession | nu
     state: String(row.state) as ExportSession["state"],
     created_at: Number(row.created_at),
     updated_at: Number(row.updated_at),
+    counts: {
+      sources: Number(row.snapshot_sources_count ?? 0),
+      pending_items: Number(row.snapshot_pending_items_count ?? 0),
+      articles: Number(row.snapshot_articles_count ?? 0),
+    },
   };
 }
 
 export async function getExportSession(db: D1Database, id: string): Promise<ExportSession | null> {
   const row = await db.prepare(`
-    SELECT id, snapshot_id, export_watermark, cursor, expires_at, state, created_at, updated_at
+    SELECT id, snapshot_id, export_watermark, cursor, expires_at, state, created_at, updated_at,
+      snapshot_sources_count, snapshot_pending_items_count, snapshot_articles_count
     FROM export_sessions WHERE id = ? LIMIT 1
   `).bind(id).first<Record<string, unknown>>();
   return sessionFromRow(row);
@@ -201,9 +208,20 @@ export async function startExport(db: D1Database, now = nowSeconds()): Promise<E
       )
       RETURNING id
     `).bind(id, snapshotId, exportWatermark, expiresAt, now, now, id),
+    db.prepare(`
+      UPDATE export_sessions
+      SET snapshot_sources_count = (SELECT COUNT(*) FROM sources),
+          snapshot_pending_items_count = (SELECT COUNT(*) FROM pending_items),
+          snapshot_articles_count = (SELECT COUNT(*) FROM articles)
+      WHERE id = ? AND state = 'active'
+      RETURNING snapshot_sources_count AS sources,
+        snapshot_pending_items_count AS pending_items,
+        snapshot_articles_count AS articles
+    `).bind(id),
   ]);
   const acquired = results[1]?.results?.[0] as { export_lock_id?: string } | undefined;
   const inserted = results[2]?.results?.[0] as { id?: string } | undefined;
+  const snapshotCounts = results[3]?.results?.[0] as ExportCounts | undefined;
   if (acquired?.export_lock_id !== id || inserted?.id !== id) {
     const systemState = await db.prepare(`
       SELECT export_lock, export_lock_expires_at, global_lease_token, global_lease_expires_at
@@ -224,6 +242,11 @@ export async function startExport(db: D1Database, now = nowSeconds()): Promise<E
     state: "active",
     created_at: now,
     updated_at: now,
+    counts: {
+      sources: Number(snapshotCounts?.sources ?? 0),
+      pending_items: Number(snapshotCounts?.pending_items ?? 0),
+      articles: Number(snapshotCounts?.articles ?? 0),
+    },
   };
 }
 
@@ -294,17 +317,7 @@ export async function getExportPage(
     throw new ExportRepositoryError(400, "invalid_export_cursor", "The export cursor is invalid");
   }
 
-  const countRow = await db.prepare(`
-    SELECT
-      (SELECT COUNT(*) FROM sources) AS sources,
-      (SELECT COUNT(*) FROM pending_items) AS pending_items,
-      (SELECT COUNT(*) FROM articles) AS articles
-  `).first<ExportCounts>();
-  const counts: ExportCounts = {
-    sources: Number(countRow?.sources ?? 0),
-    pending_items: Number(countRow?.pending_items ?? 0),
-    articles: Number(countRow?.articles ?? 0),
-  };
+  const counts = activeSession.counts;
   const records: ExportRecord[] = [];
   let last: ExportCursor | null = null;
   let stop = false;
