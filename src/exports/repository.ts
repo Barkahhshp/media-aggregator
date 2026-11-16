@@ -1,3 +1,5 @@
+import { checkWriteGate, completeWriteReservation } from "../ingest/storage-guard";
+
 export const EXPORT_SCHEMA_VERSION = 1;
 export const EXPORT_LOCK_SECONDS = 30 * 60;
 export const EXPORT_PAGE_RECORD_LIMIT = 10;
@@ -186,20 +188,26 @@ export async function startExport(db: D1Database, now = nowSeconds()): Promise<E
   const snapshotId = crypto.randomUUID();
   const exportWatermark = String(now);
   const expiresAt = now + EXPORT_LOCK_SECONDS;
-  const results = await db.batch([
-    db.prepare(`
-      UPDATE export_sessions SET state = 'expired', updated_at = ?
-      WHERE state = 'active' AND expires_at <= ?
-    `).bind(now, now),
-    db.prepare(`
+  const reservation = await checkWriteGate(db, "run", 4 * 1024, crypto.randomUUID(), now);
+  if (reservation === "storage_limit") {
+    throw new ExportRepositoryError(503, "storage_limit", "Exports are paused because storage is full");
+  }
+  let latestSize = reservation.measuredSize;
+  try {
+    const results = await db.batch([
+      db.prepare(`
+        DELETE FROM export_sessions
+        WHERE state IN ('completed', 'expired', 'aborted') OR (state = 'active' AND expires_at <= ?)
+      `).bind(now),
+      db.prepare(`
       UPDATE system_state
       SET export_lock = 1, export_lock_id = ?, export_lock_expires_at = ?, updated_at = ?
       WHERE singleton_id = 'global'
         AND (export_lock = 0 OR export_lock_expires_at IS NULL OR export_lock_expires_at <= ?)
         AND (global_lease_token IS NULL OR global_lease_expires_at IS NULL OR global_lease_expires_at <= ?)
       RETURNING export_lock_id
-    `).bind(id, expiresAt, now, now, now),
-    db.prepare(`
+      `).bind(id, expiresAt, now, now, now),
+      db.prepare(`
       INSERT INTO export_sessions (id, snapshot_id, export_watermark, cursor, expires_at, state, created_at, updated_at)
       SELECT ?, ?, ?, NULL, ?, 'active', ?, ?
       WHERE EXISTS (
@@ -207,8 +215,8 @@ export async function startExport(db: D1Database, now = nowSeconds()): Promise<E
         WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_id = ?
       )
       RETURNING id
-    `).bind(id, snapshotId, exportWatermark, expiresAt, now, now, id),
-    db.prepare(`
+      `).bind(id, snapshotId, exportWatermark, expiresAt, now, now, id),
+      db.prepare(`
       UPDATE export_sessions
       SET snapshot_sources_count = (SELECT COUNT(*) FROM sources),
           snapshot_pending_items_count = (SELECT COUNT(*) FROM pending_items),
@@ -217,48 +225,52 @@ export async function startExport(db: D1Database, now = nowSeconds()): Promise<E
       RETURNING snapshot_sources_count AS sources,
         snapshot_pending_items_count AS pending_items,
         snapshot_articles_count AS articles
-    `).bind(id),
-  ]);
-  const acquired = results[1]?.results?.[0] as { export_lock_id?: string } | undefined;
-  const inserted = results[2]?.results?.[0] as { id?: string } | undefined;
-  const snapshotCounts = results[3]?.results?.[0] as ExportCounts | undefined;
-  if (acquired?.export_lock_id !== id || inserted?.id !== id) {
-    const systemState = await db.prepare(`
-      SELECT export_lock, export_lock_expires_at, global_lease_token, global_lease_expires_at
-      FROM system_state WHERE singleton_id = 'global' LIMIT 1
-    `).first<Record<string, unknown>>();
-    const liveExport = Number(systemState?.export_lock) === 1 && Number(systemState?.export_lock_expires_at ?? 0) > now;
-    if (liveExport) {
-      throw new ExportRepositoryError(423, "export_in_progress", "Another export currently holds the export lock");
+      `).bind(id),
+    ]);
+    latestSize = results.reduce((largest, result) => Math.max(largest, result.meta.size_after ?? reservation.measuredSize), reservation.measuredSize);
+    const acquired = results[1]?.results?.[0] as { export_lock_id?: string } | undefined;
+    const inserted = results[2]?.results?.[0] as { id?: string } | undefined;
+    const snapshotCounts = results[3]?.results?.[0] as ExportCounts | undefined;
+    if (acquired?.export_lock_id !== id || inserted?.id !== id) {
+      const systemState = await db.prepare(`
+        SELECT export_lock, export_lock_expires_at, global_lease_token, global_lease_expires_at
+        FROM system_state WHERE singleton_id = 'global' LIMIT 1
+      `).first<Record<string, unknown>>();
+      const liveExport = Number(systemState?.export_lock) === 1 && Number(systemState?.export_lock_expires_at ?? 0) > now;
+      if (liveExport) {
+        throw new ExportRepositoryError(423, "export_in_progress", "Another export currently holds the export lock");
+      }
+      throw new ExportRepositoryError(409, "ingestion_in_progress", "Wait for the active ingestion lease to finish before exporting");
     }
-    throw new ExportRepositoryError(409, "ingestion_in_progress", "Wait for the active ingestion lease to finish before exporting");
+    return {
+      id,
+      snapshot_id: snapshotId,
+      export_watermark: exportWatermark,
+      cursor: null,
+      expires_at: expiresAt,
+      state: "active",
+      created_at: now,
+      updated_at: now,
+      counts: {
+        sources: Number(snapshotCounts?.sources ?? 0),
+        pending_items: Number(snapshotCounts?.pending_items ?? 0),
+        articles: Number(snapshotCounts?.articles ?? 0),
+      },
+    };
+  } finally {
+    await completeWriteReservation(db, reservation.id, latestSize, now);
   }
-  return {
-    id,
-    snapshot_id: snapshotId,
-    export_watermark: exportWatermark,
-    cursor: null,
-    expires_at: expiresAt,
-    state: "active",
-    created_at: now,
-    updated_at: now,
-    counts: {
-      sources: Number(snapshotCounts?.sources ?? 0),
-      pending_items: Number(snapshotCounts?.pending_items ?? 0),
-      articles: Number(snapshotCounts?.articles ?? 0),
-    },
-  };
 }
 
 async function markExpiredAndRelease(db: D1Database, sessionId: string, now: number): Promise<void> {
   await db.batch([
-    db.prepare("UPDATE export_sessions SET state = 'expired', updated_at = ? WHERE id = ? AND state = 'active'")
-      .bind(now, sessionId),
     db.prepare(`
       UPDATE system_state
       SET export_lock = 0, export_lock_id = NULL, export_lock_expires_at = NULL, updated_at = ?
       WHERE singleton_id = 'global' AND export_lock_id = ?
     `).bind(now, sessionId),
+    db.prepare("DELETE FROM export_sessions WHERE id = ? AND state = 'active'")
+      .bind(sessionId),
   ]);
 }
 
@@ -405,13 +417,11 @@ export async function getExportPage(
 export async function endExport(db: D1Database, sessionId: string, now = nowSeconds()): Promise<void> {
   await db.batch([
     db.prepare(`
-      UPDATE export_sessions SET state = 'completed', cursor = NULL, updated_at = ?
-      WHERE id = ? AND state = 'active'
-    `).bind(now, sessionId),
-    db.prepare(`
       UPDATE system_state
       SET export_lock = 0, export_lock_id = NULL, export_lock_expires_at = NULL, updated_at = ?
       WHERE singleton_id = 'global' AND export_lock_id = ?
     `).bind(now, sessionId),
+    db.prepare("DELETE FROM export_sessions WHERE id = ?")
+      .bind(sessionId),
   ]);
 }

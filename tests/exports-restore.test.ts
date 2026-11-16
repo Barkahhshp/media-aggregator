@@ -5,6 +5,7 @@ import type { D1Migration } from "@cloudflare/vitest-plugin";
 
 interface TestEnvironment {
   DB: D1Database;
+  RATE_LIMITER: RateLimit;
   APP_ENV: "test";
   API_TOKEN: string;
   TEST_MIGRATIONS: D1Migration[];
@@ -29,10 +30,21 @@ interface RestoreModule {
   restoreExport(db: D1Database, ndjson: string): Promise<RestoreResult>;
 }
 
+interface ArticleStoreModule {
+  saveArticleAndCompletePending(db: D1Database, item: Record<string, unknown>, article: {
+    title: string; summary: string | null; author: string | null; publishedAt: string | null; contentText: string;
+  }): Promise<{ status: string }>;
+}
+
 const runtimeEnv = env as unknown as Omit<TestEnvironment, "API_TOKEN">;
-const testEnv: TestEnvironment = { ...runtimeEnv, API_TOKEN: "local-test-token" };
+const testEnv: TestEnvironment = {
+  ...runtimeEnv,
+  API_TOKEN: "local-test-token",
+  RATE_LIMITER: { limit: async () => ({ success: true }) },
+};
 const appModules = import.meta.glob<ExportsAppModule>("../src/app.ts");
 const restoreModules = import.meta.glob<RestoreModule>("../src/exports/restore.ts");
+const articleStoreModules = import.meta.glob<ArticleStoreModule>("../src/ingest/article-store.ts");
 
 async function loadApp() {
   const moduleLoader = appModules["../src/app.ts"];
@@ -44,6 +56,13 @@ async function loadApp() {
 
 async function loadRestore() {
   const moduleLoader = restoreModules["../src/exports/restore.ts"];
+  expect(moduleLoader).toBeDefined();
+  if (!moduleLoader) return undefined;
+  return await moduleLoader();
+}
+
+async function loadArticleStore() {
+  const moduleLoader = articleStoreModules["../src/ingest/article-store.ts"];
   expect(moduleLoader).toBeDefined();
   if (!moduleLoader) return undefined;
   return await moduleLoader();
@@ -195,6 +214,36 @@ describe("local export restore", () => {
         { article_id: "restore-article-1", title: "Title restore-article-1", snippet: "Summary restore-article-1" },
         { article_id: "restore-article-2", title: "Title restore-article-2", snippet: "Summary restore-article-2" },
       ] });
+  });
+
+  it("round_trips_content_too_large_articles_with_hash_semantics_matching_stored_text", async () => {
+    const app = await loadApp();
+    const restore = await loadRestore();
+    const articleStore = await loadArticleStore();
+    if (!app || !restore || !articleStore) return;
+    await seedExportFixture();
+    const now = Math.floor(Date.now() / 1000);
+    await testEnv.DB.prepare(`
+      INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, status, lease_token, lease_expires_at)
+      VALUES ('oversized-pending', 'restore-source', 'article', 'oversized-identity',
+        'https://example.com/oversized', 'leased', 'oversized-lease', ?)
+    `).bind(now + 120).run();
+    const leased = await testEnv.DB.prepare("SELECT * FROM pending_items WHERE id = 'oversized-pending'")
+      .first<Record<string, unknown>>();
+    expect(leased).not.toBeNull();
+    const saved = await articleStore.saveArticleAndCompletePending(testEnv.DB, leased ?? {}, {
+      title: "Oversized", summary: null, author: null, publishedAt: null, contentText: "x".repeat(512_001),
+    });
+    expect(saved.status).toBe("content_too_large");
+    const { session, ndjson } = await exportAllPages(app);
+    await request(app, `/v1/exports/${session.id}`, "DELETE");
+    await clearDataRows();
+
+    const restored = await restore.restoreExport(testEnv.DB, ndjson);
+
+    expect(restored.verified_article_hashes).toBe(3);
+    expect(await testEnv.DB.prepare("SELECT content_text, content_hash, status FROM articles WHERE canonical_url = 'https://example.com/oversized'").first())
+      .toEqual({ content_text: "", content_hash: await sha256("x".repeat(512_001)), status: "content_too_large" });
   });
 
   it("refuses_to_restore_into_a_non_empty_target_without_mutating_it", async () => {

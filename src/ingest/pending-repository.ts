@@ -508,6 +508,7 @@ export async function claimPending(
           (status IN ('pending', 'retry_wait') AND next_attempt_at <= ?)
           OR (status = 'leased' AND lease_expires_at <= ?)
         ) AND (? IS NULL OR item_type = ?)
+          AND EXISTS (SELECT 1 FROM sources WHERE sources.id = pending_items.source_id AND sources.enabled = 1)
         ORDER BY discovered_at ASC, id ASC
         LIMIT 1
       )

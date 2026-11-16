@@ -96,9 +96,26 @@ export async function createSource(db: D1Database, input: SourceInput): Promise<
   return toSource(row);
 }
 
-export async function listSources(db: D1Database): Promise<Source[]> {
-  const result = await db.prepare("SELECT * FROM sources ORDER BY created_at ASC, id ASC").all<SourceRow>();
-  return result.results.map(toSource);
+export interface SourceWithBacklog extends Source {
+  pending_count: number;
+  oldest_pending_at: number | null;
+}
+
+export async function listSources(db: D1Database): Promise<SourceWithBacklog[]> {
+  const result = await db.prepare(`
+    SELECT source.*,
+      (SELECT COUNT(*) FROM pending_items AS pending
+       WHERE pending.source_id = source.id AND pending.status IN ('pending', 'leased', 'retry_wait')) AS pending_count,
+      (SELECT MIN(pending.discovered_at) FROM pending_items AS pending
+       WHERE pending.source_id = source.id AND pending.status IN ('pending', 'leased', 'retry_wait')) AS oldest_pending_at
+    FROM sources AS source
+    ORDER BY source.created_at ASC, source.id ASC
+  `).all<SourceRow & { pending_count: number; oldest_pending_at: number | null }>();
+  return result.results.map((row) => ({
+    ...toSource(row),
+    pending_count: row.pending_count,
+    oldest_pending_at: row.oldest_pending_at,
+  }));
 }
 
 export async function updateSource(
@@ -112,7 +129,13 @@ export async function updateSource(
   const row = await db
     .prepare(
       `UPDATE sources
-       SET url = ?, kind = ?, host = ?, poll_interval_sec = ?, selectors_json = ?, enabled = COALESCE(?, enabled), updated_at = unixepoch()
+       SET url = ?, kind = ?, host = ?, poll_interval_sec = ?, selectors_json = ?, enabled = COALESCE(?, enabled),
+           last_status = CASE
+             WHEN COALESCE(?, enabled) = 0 THEN 'disabled_source'
+             WHEN COALESCE(?, enabled) = 1 AND last_status = 'disabled_source' THEN NULL
+             ELSE last_status
+           END,
+           updated_at = unixepoch()
        WHERE id = ?
          AND (COALESCE(?, enabled) = 0 OR enabled = 1 OR (SELECT COUNT(*) FROM sources WHERE enabled = 1) < ?)
          AND NOT EXISTS (
@@ -127,6 +150,8 @@ export async function updateSource(
       url.hostname.toLowerCase(),
       input.poll_interval_sec,
       input.selectors === undefined ? null : JSON.stringify(input.selectors),
+      nextEnabled,
+      nextEnabled,
       nextEnabled,
       id,
       nextEnabled,
@@ -148,7 +173,7 @@ export async function updateSource(
 export async function disableSource(db: D1Database, id: string): Promise<Source | null> {
   const row = await db
     .prepare(`
-      UPDATE sources SET enabled = 0, updated_at = unixepoch()
+      UPDATE sources SET enabled = 0, last_status = 'disabled_source', updated_at = unixepoch()
       WHERE id = ? AND NOT EXISTS (
         SELECT 1 FROM system_state
         WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_expires_at > unixepoch()

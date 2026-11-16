@@ -6,6 +6,7 @@ import { runScheduled } from "../src/ingest/scheduler";
 
 interface TestEnvironment {
   DB: D1Database;
+  RATE_LIMITER: RateLimit;
   APP_ENV: "test";
   API_TOKEN: string;
   TEST_MIGRATIONS: D1Migration[];
@@ -45,7 +46,11 @@ interface ExportManifest {
 }
 
 const runtimeEnv = env as unknown as Omit<TestEnvironment, "API_TOKEN">;
-const testEnv: TestEnvironment = { ...runtimeEnv, API_TOKEN: "local-test-token" };
+const testEnv: TestEnvironment = {
+  ...runtimeEnv,
+  API_TOKEN: "local-test-token",
+  RATE_LIMITER: { limit: async () => ({ success: true }) },
+};
 const appModules = import.meta.glob<ExportsAppModule>("../src/app.ts");
 const repositoryModules = import.meta.glob<ExportRepositoryModule>("../src/exports/repository.ts");
 
@@ -298,6 +303,7 @@ describe("consistent export API", () => {
     expect(ended.status).toBe(200);
     expect(await testEnv.DB.prepare("SELECT export_lock, export_lock_id, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'").first())
       .toEqual({ export_lock: 0, export_lock_id: null, export_lock_expires_at: null });
+    expect(await testEnv.DB.prepare("SELECT id FROM export_sessions WHERE id = ?").bind(session.id).first()).toBeNull();
   });
 
   it("sets_a_30_minute_expiry_and_reclaims_the_existing_lock_at_expiry", async () => {
@@ -311,9 +317,45 @@ describe("consistent export API", () => {
 
     expect(second.id).not.toBe(first.id);
     expect(second.expires_at).toBe(first.expires_at + 30 * 60);
-    expect(await testEnv.DB.prepare("SELECT state FROM export_sessions WHERE id = ?").bind(first.id).first())
-      .toEqual({ state: "expired" });
+    expect(await testEnv.DB.prepare("SELECT id FROM export_sessions WHERE id = ?").bind(first.id).first())
+      .toBeNull();
     await repository.endExport(testEnv.DB, second.id);
+  });
+
+  it("purges_stale_export_sessions_without_removing_an_active_session_or_lock", async () => {
+    const repository = await loadExportRepository();
+    if (!repository) return;
+    const now = Math.floor(Date.now() / 1000);
+    await testEnv.DB.prepare(`
+      INSERT INTO export_sessions (id, snapshot_id, export_watermark, expires_at, state, created_at, updated_at)
+      VALUES ('stale-completed', 'snapshot-old-1', '1', ?, 'completed', ?, ?),
+             ('stale-expired', 'snapshot-old-2', '2', ?, 'expired', ?, ?)
+    `).bind(now - 1, now - 100, now - 100, now - 1, now - 100, now - 100).run();
+    const active = await repository.startExport(testEnv.DB, now);
+    const count = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM export_sessions").first<{ count: number }>();
+    const lock = await testEnv.DB.prepare("SELECT export_lock, export_lock_id FROM system_state WHERE singleton_id = 'global'")
+      .first<{ export_lock: number; export_lock_id: string | null }>();
+
+    expect(count?.count).toBe(1);
+    expect(await testEnv.DB.prepare("SELECT id FROM export_sessions WHERE id IN ('stale-completed', 'stale-expired')").first()).toBeNull();
+    expect(lock).toEqual({ export_lock: 1, export_lock_id: active.id });
+    await repository.endExport(testEnv.DB, active.id);
+  });
+
+  it("refuses_to_create_an_export_session_when_the_storage_gate_is_closed", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = ?, storage_state = 'storage_limit' WHERE singleton_id = 'global'")
+      .bind(280 * 1024 * 1024).run();
+
+    const response = await apiRequest(app, "/v1/exports", "POST");
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "storage_limit" } });
+    expect(await testEnv.DB.prepare("SELECT export_lock, export_lock_id FROM system_state WHERE singleton_id = 'global'").first())
+      .toEqual({ export_lock: 0, export_lock_id: null });
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM export_sessions").first())
+      .toEqual({ count: 0 });
   });
 
   it("refuses_to_start_until_an_existing_ingestion_lease_has_finished", async () => {

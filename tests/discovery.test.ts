@@ -5,7 +5,7 @@ import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { getSource } from "../src/sources/repository";
 import { claimPending } from "../src/ingest/pending-repository";
 import type { Source } from "../src/sources/types";
-import type { Candidate, SourceCursor } from "../src/ingest/types";
+import type { SourceCursor } from "../src/ingest/types";
 
 interface DiscoveryResult {
   enqueued: number;

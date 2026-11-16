@@ -6,8 +6,9 @@ import { createSource } from "../src/sources/repository";
 
 interface TestEnvironment {
   DB: D1Database;
-  APP_ENV: "test";
+  APP_ENV: "test" | "local" | "production";
   API_TOKEN: string;
+  RATE_LIMITER: RateLimit;
   TEST_MIGRATIONS: D1Migration[];
 }
 
@@ -18,7 +19,11 @@ interface SourcesAppModule {
 }
 
 const runtimeEnv = env as unknown as Omit<TestEnvironment, "API_TOKEN">;
-const testEnv: TestEnvironment = { ...runtimeEnv, API_TOKEN: "local-test-token" };
+const testEnv: TestEnvironment = {
+  ...runtimeEnv,
+  API_TOKEN: "local-test-token",
+  RATE_LIMITER: { limit: async () => ({ success: true }) },
+};
 const appModules = import.meta.glob<SourcesAppModule>("../src/app.ts");
 
 async function loadApp() {
@@ -62,6 +67,42 @@ describe("source management API", () => {
     expect(response.status).toBe(401);
   });
 
+  it("rate_limits_each_authenticated_service_token_separately_without_exposing_its_identity", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const keys: string[] = [];
+    const counts = new Map<string, number>();
+    const rateLimiter: RateLimit = {
+      async limit({ key }) {
+        keys.push(key);
+        const count = (counts.get(key) ?? 0) + 1;
+        counts.set(key, count);
+        return { success: count <= 1 };
+      },
+    };
+    const productionEnv = { ...testEnv, APP_ENV: "production" as const, RATE_LIMITER: rateLimiter };
+    const accessToken = (commonName: string) => {
+      const payload = btoa(JSON.stringify({ common_name: commonName })).replace(/=/gu, "").replace(/\+/gu, "-").replace(/\//gu, "_");
+      return `header.${payload}.signature`;
+    };
+    const serviceRequest = (commonName: string) => app.request("/v1/sources", {
+      headers: { "Cf-Access-Jwt-Assertion": accessToken(commonName) },
+    }, productionEnv);
+
+    expect((await serviceRequest("token-one-client-id")).status).toBe(200);
+    const limited = await serviceRequest("token-one-client-id");
+    const separate = await serviceRequest("token-two-client-id");
+
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toMatchObject({ error: { code: "rate_limit_exceeded" } });
+    expect(separate.status).toBe(200);
+    expect(keys).toHaveLength(3);
+    expect(keys[0]).toBe(keys[1]);
+    expect(keys[0]).not.toBe(keys[2]);
+    expect(keys.join(" ")).not.toContain("token-one-client-id");
+    expect(keys.join(" ")).not.toContain("token-two-client-id");
+  });
+
   it("creates_lists_updates_and_soft_disables_a_source", async () => {
     const app = await loadApp();
     if (!app) return;
@@ -93,6 +134,46 @@ describe("source management API", () => {
     expect(disabled.source.enabled).toBe(false);
   });
 
+  it("exposes_per_source_pending_backlog_and_global_storage_status", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const created = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed", url: "https://example.com/backlog-visible.xml",
+    });
+    const source = await created.json<{ source: { id: string } }>();
+    const disabledCreated = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed", url: "https://example.com/disabled-backlog-visible.xml",
+    });
+    const disabledSource = await disabledCreated.json<{ source: { id: string } }>();
+    await sourceRequest(app, `/v1/sources/${disabledSource.source.id}`, "DELETE");
+    const now = Math.floor(Date.now() / 1000);
+    await testEnv.DB.prepare(`
+      INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, status, discovered_at)
+      VALUES ('backlog-visible-1', ?, 'article', 'backlog-1', 'https://example.com/backlog-1', 'pending', ?)
+    `).bind(source.source.id, now - 120).run();
+    await testEnv.DB.prepare(`
+      INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, status, discovered_at)
+      VALUES ('backlog-disabled-1', ?, 'article', 'disabled-backlog-1', 'https://example.com/disabled-backlog-1', 'pending', ?)
+    `).bind(disabledSource.source.id, now - 300).run();
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = ?, storage_state = 'storage_limit' WHERE singleton_id = 'global'")
+      .bind(280 * 1024 * 1024).run();
+
+    const listed = await sourceRequest(app, "/v1/sources");
+    const status = await sourceRequest(app, "/v1/status");
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({
+      pending: { active_count: 1, disabled_count: 1, oldest_age_seconds: expect.any(Number) },
+      storage: { observed_db_size: expect.any(Number), state: expect.any(String) },
+    });
+
+    const listedPayload = await listed.json<{ sources: Array<Record<string, unknown>> }>();
+    expect(listedPayload.sources).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: source.source.id, pending_count: 1, oldest_pending_at: now - 120 }),
+      expect.objectContaining({ id: disabledSource.source.id, pending_count: 1, oldest_pending_at: now - 300, last_status: "disabled_source" }),
+    ]));
+    expect(status.status).toBe(200);
+  });
+
   it("patching_other_fields_does_not_reenable_a_disabled_source", async () => {
     const app = await loadApp();
     if (!app) return;
@@ -111,6 +192,38 @@ describe("source management API", () => {
     expect(response.status).toBe(200);
     const updated = await response.json<{ source: Record<string, unknown> }>();
     expect(updated.source).toMatchObject({ enabled: false, poll_interval_sec: 900 });
+  });
+
+  it("rejects_a_null_poll_interval_instead_of_treating_it_as_missing", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const created = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed", url: "https://example.com/null-interval.xml",
+    });
+    const source = await created.json<{ source: { id: string } }>();
+
+    const response = await sourceRequest(app, `/v1/sources/${source.source.id}`, "PATCH", { poll_interval_sec: null });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: "invalid_source_update" } });
+    expect(await testEnv.DB.prepare("SELECT poll_interval_sec FROM sources WHERE id = ?").bind(source.source.id).first())
+      .toEqual({ poll_interval_sec: 7200 });
+  });
+
+  it("clears_disabled_source_status_when_the_source_is_reenabled", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const created = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed", url: "https://example.com/re-enable.xml",
+    });
+    const source = await created.json<{ source: { id: string } }>();
+    await sourceRequest(app, `/v1/sources/${source.source.id}`, "DELETE");
+
+    const response = await sourceRequest(app, `/v1/sources/${source.source.id}`, "PATCH", { enabled: true });
+    const updated = await response.json<{ source: { enabled: boolean; last_status: string | null } }>();
+
+    expect(response.status).toBe(200);
+    expect(updated.source).toMatchObject({ enabled: true, last_status: null });
   });
 
   it("allows_disabling_a_legacy_html_list_source_without_itemLink", async () => {

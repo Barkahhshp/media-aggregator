@@ -5,6 +5,7 @@ import type { D1Migration } from "@cloudflare/vitest-plugin";
 
 interface TestEnvironment {
   DB: D1Database;
+  RATE_LIMITER: RateLimit;
   APP_ENV: "test";
   API_TOKEN: string;
   TEST_MIGRATIONS: D1Migration[];
@@ -17,7 +18,11 @@ interface ArticlesAppModule {
 }
 
 const runtimeEnv = env as unknown as Omit<TestEnvironment, "API_TOKEN">;
-const testEnv: TestEnvironment = { ...runtimeEnv, API_TOKEN: "local-test-token" };
+const testEnv: TestEnvironment = {
+  ...runtimeEnv,
+  API_TOKEN: "local-test-token",
+  RATE_LIMITER: { limit: async () => ({ success: true }) },
+};
 const appModules = import.meta.glob<ArticlesAppModule>("../src/app.ts");
 
 async function loadApp() {
@@ -55,6 +60,24 @@ async function seedArticle(id: string, overrides: { sourceId?: string; contentTe
   ).run();
   await testEnv.DB.prepare("INSERT INTO articles_fts (article_id, title, snippet) VALUES (?, ?, ?)")
     .bind(id, "Example headline", "Example snippet").run();
+}
+
+async function seedFilteredArticle(
+  id: string,
+  sourceId: string,
+  publishedAt: string,
+  fetchedAt: number,
+  title: string,
+  snippet: string,
+): Promise<void> {
+  await testEnv.DB.prepare("INSERT OR IGNORE INTO sources (id, url, kind, host) VALUES (?, ?, 'feed', 'example.com')")
+    .bind(sourceId, `https://example.com/${sourceId}`).run();
+  await testEnv.DB.prepare(`
+    INSERT INTO articles (id, source_id, canonical_url, title, summary, published_at, fetched_at, content_text, content_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'body', ?)
+  `).bind(id, sourceId, `https://example.com/${id}`, title, snippet, publishedAt, fetchedAt, `hash-${id}`).run();
+  await testEnv.DB.prepare("INSERT INTO articles_fts (article_id, title, snippet) VALUES (?, ?, ?)")
+    .bind(id, title, snippet).run();
 }
 
 beforeEach(async () => {
@@ -97,6 +120,29 @@ describe("article REST API", () => {
       status: "stored",
     });
     expect(payload.article).toHaveProperty("content_hash");
+  });
+
+  it("propagates_source_from_to_q_and_cursor_filters_together", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const sourceId = "filtered-source";
+    await seedFilteredArticle("match-1", sourceId, "2026-11-16T00:00:00.000Z", 100, "Needle one", "needle snippet");
+    await seedFilteredArticle("match-2", sourceId, "2026-11-16T23:59:59.000Z", 90, "Needle two", "needle snippet");
+    await seedFilteredArticle("wrong-source", "other-source", "2026-11-16T12:00:00.000Z", 200, "Needle other", "needle snippet");
+    await seedFilteredArticle("before-window", sourceId, "2026-11-15T23:59:59.000Z", 300, "Needle early", "needle snippet");
+    await seedFilteredArticle("at-exclusive-to", sourceId, "2026-11-17T00:00:00.000Z", 400, "Needle late", "needle snippet");
+    await seedFilteredArticle("wrong-query", sourceId, "2026-11-16T12:00:00.000Z", 500, "Different topic", "other snippet");
+    const filters = `source_id=${sourceId}&from=2026-11-16T00:00:00.000Z&to=2026-11-17T00:00:00.000Z&q=needle&limit=1`;
+
+    const first = await articleRequest(app, `/v1/articles?${filters}`);
+    const firstPayload = await first.json<{ articles: Array<{ id: string }>; next_cursor: string | null }>();
+    expect(firstPayload.articles.map((article) => article.id)).toEqual(["match-2"]);
+    expect(firstPayload.next_cursor).toBeTypeOf("string");
+
+    const second = await articleRequest(app, `/v1/articles?${filters}&cursor=${encodeURIComponent(firstPayload.next_cursor ?? "")}`);
+    const secondPayload = await second.json<{ articles: Array<{ id: string }>; next_cursor: string | null }>();
+    expect(secondPayload.articles.map((article) => article.id)).toEqual(["match-1"]);
+    expect(secondPayload.next_cursor).toBeNull();
   });
 
   it("returns_a_canonical_JSON_not_found_error_with_the_request_id", async () => {

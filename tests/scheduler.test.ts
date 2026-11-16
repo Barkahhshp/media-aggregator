@@ -5,7 +5,7 @@ import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { enqueueCandidates } from "../src/ingest/pending-repository";
 import type { Candidate } from "../src/ingest/types";
 import type { Source, SourceKind } from "../src/sources/types";
-import { getSource } from "../src/sources/repository";
+import { disableSource, getSource } from "../src/sources/repository";
 
 interface TestBindings {
   DB: D1Database;
@@ -216,6 +216,27 @@ describe("scheduled ingestion", () => {
     expect(requests).toHaveLength(2);
     expect(requests.every((url) => url.includes("article-"))).toBe(true);
     expect(await sourceState(source.id)).toMatchObject({ next_fetch_at: 1 });
+  });
+
+  it("keeps_disabled_source_backlog_without_claiming_or_fetching_it", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    const source = await makeSource("feed", "disabled-backlog", Math.floor(Date.now() / 1000) + 999_999);
+    await seedPending(source, 1);
+    await testEnv.DB.prepare("UPDATE pending_items SET status = 'retry_wait', next_attempt_at = ? WHERE source_id = ?")
+      .bind(Math.floor(Date.now() / 1000) + 999_999, source.id).run();
+    await disableSource(testEnv.DB, source.id);
+    const fetchStub = vi.fn(async () => new Response("must not fetch"));
+    vi.stubGlobal("fetch", fetchStub);
+
+    const result = await scheduler.runScheduled(testEnv, Date.now());
+
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: "partial", errorCode: "disabled_source" });
+    expect(await testEnv.DB.prepare("SELECT status, attempts, lease_token FROM pending_items WHERE source_id = ?")
+      .bind(source.id).first()).toEqual({ status: "retry_wait", attempts: 0, lease_token: null });
+    expect(await sourceState(source.id)).toMatchObject({ enabled: 0, last_status: "disabled_source" });
+    expect(await runs()).toMatchObject([{ status: "partial", error_code: "disabled_source" }]);
   });
 
   it("never_fetches_more_than_one_due_source_per_invocation", async () => {

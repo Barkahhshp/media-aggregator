@@ -806,6 +806,20 @@ describe("durable pending repository", () => {
     expect(reclaimed).toMatchObject({ status: "leased", lease_token: "lease-reclaim" });
   });
 
+  it("does_not_claim_pending_backlog_for_a_disabled_source", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+    await repository.enqueueCandidates(testEnv.DB, source, [makeCandidate(70)], {});
+    await testEnv.DB.prepare("UPDATE sources SET enabled = 0 WHERE id = ?").bind(source.id).run();
+
+    const claimed = await repository.claimPending(testEnv.DB, Math.floor(Date.now() / 1000) + 10, "disabled-source-lease");
+
+    expect(claimed).toBeNull();
+    expect(await testEnv.DB.prepare("SELECT status, attempts, lease_token FROM pending_items WHERE source_id = ?")
+      .bind(source.id).first()).toEqual({ status: "pending", attempts: 0, lease_token: null });
+  });
+
   it("does_not_claim_pending_items_when_the_storage_write_gate_is_closed", async () => {
     const repository = await loadRepository();
     if (!repository) return;

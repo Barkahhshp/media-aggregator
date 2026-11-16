@@ -30,23 +30,21 @@ describe("physical local D1 storage threshold", () => {
 
     const totalRows = 575;
     const batchRows = 50;
-    let sizeAfter = 0;
     for (let start = 0; start < totalRows; start += batchRows) {
       const end = Math.min(start + batchRows - 1, totalRows - 1);
-      const result = await testEnv.DB.prepare(`
+      await testEnv.DB.prepare(`
         WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ?)
         INSERT INTO articles (id, source_id, external_id, canonical_url, title, content_text, content_hash)
         SELECT lower(hex(randomblob(16))), ?, 'probe-' || i,
                'https://example.com/physical/' || i, 'Probe', CAST(zeroblob(512000) AS TEXT), 'hash-' || i
         FROM n
       `).bind(start, end, sourceId).run();
-      sizeAfter = result.meta.size_after;
     }
     const ftsResult = await testEnv.DB.prepare(`
       INSERT INTO articles_fts (article_id, title, snippet)
       SELECT id, title, 'Physical local D1 fill' FROM articles WHERE source_id = ?
     `).bind(sourceId).run();
-    sizeAfter = ftsResult.meta.size_after;
+    const sizeAfter = ftsResult.meta.size_after;
 
     console.log(`LOCAL_D1_PHYSICAL_SIZE_AFTER=${sizeAfter}; STOP_BYTES=${280 * 1024 * 1024}`);
     expect(sizeAfter).toBeGreaterThanOrEqual(280 * 1024 * 1024);

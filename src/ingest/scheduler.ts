@@ -618,13 +618,29 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
 
     const eligible = await db.prepare(`
       SELECT
-        SUM(CASE WHEN item_type = 'sitemap' THEN 1 ELSE 0 END) AS sitemap_count,
-        COUNT(*) AS pending_count
-      FROM pending_items
-      WHERE (status IN ('pending', 'retry_wait') AND next_attempt_at <= ?)
-         OR (status = 'leased' AND lease_expires_at <= ?)
-    `).bind(now, now).first<{ sitemap_count: number | null; pending_count: number }>();
+        SUM(CASE WHEN source.enabled = 1 AND pending.item_type = 'sitemap' THEN 1 ELSE 0 END) AS sitemap_count,
+        SUM(CASE WHEN source.enabled = 1 THEN 1 ELSE 0 END) AS pending_count,
+        SUM(CASE WHEN source.enabled = 0 THEN 1 ELSE 0 END) AS disabled_pending_count
+      FROM pending_items AS pending
+      JOIN sources AS source ON source.id = pending.source_id
+      WHERE (
+        (source.enabled = 1 AND (
+          (pending.status IN ('pending', 'retry_wait') AND pending.next_attempt_at <= ?)
+          OR (pending.status = 'leased' AND pending.lease_expires_at <= ?)
+        ))
+        OR (source.enabled = 0 AND pending.status IN ('pending', 'retry_wait', 'leased'))
+      )
+    `).bind(now, now).first<{
+      sitemap_count: number | null;
+      pending_count: number | null;
+      disabled_pending_count: number | null;
+    }>();
     const pendingCount = eligible?.pending_count ?? 0;
+    if ((eligible?.disabled_pending_count ?? 0) > 0) {
+      result.status = "partial";
+      result.errorCode = "disabled_source";
+      runErrorMessage ??= "Pending items are retained for disabled sources and will not be fetched";
+    }
     let dueSource: Source | null = null;
     const drainArticles = async (limit: number) => {
       const target = Math.min(ARTICLE_FETCH_LIMIT, result.articleFetches + limit);

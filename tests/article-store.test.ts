@@ -106,6 +106,11 @@ async function articleRows(): Promise<ArticleRow[]> {
   return (await testEnv.DB.prepare("SELECT * FROM articles ORDER BY id").all<ArticleRow>()).results;
 }
 
+async function sha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);
@@ -172,7 +177,11 @@ describe("article storage and pending completion", () => {
     });
 
     expect(result.status).toBe("content_too_large");
-    expect(await articleRows()).toMatchObject([{ status: "content_too_large", content_text: "" }]);
+    expect(await articleRows()).toMatchObject([{
+      status: "content_too_large",
+      content_text: "",
+      content_hash: await sha256("x".repeat(512_001)),
+    }]);
     expect(await testEnv.DB.prepare("SELECT id FROM pending_items WHERE id = ?").bind(item.id).first()).toBeNull();
   });
 

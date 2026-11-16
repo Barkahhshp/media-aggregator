@@ -17,8 +17,6 @@ export interface ArticlePage {
   next_cursor: string | null;
 }
 
-interface ArticleListRow extends ArticleListItem {}
-
 function ftsTerms(query: string): string[] {
   return query.match(/[\p{L}\p{N}]+/gu) ?? [];
 }
@@ -89,7 +87,7 @@ export async function listArticles(db: D1Database, query: ArticleQuery): Promise
     ${where}
     ORDER BY article.published_at DESC NULLS LAST, article.fetched_at DESC, article.id DESC
     LIMIT ?
-  `).bind(...bindings, limit + 1).all<ArticleListRow>();
+  `).bind(...bindings, limit + 1).all<ArticleListItem>();
 
   const hasMore = rows.results.length > limit;
   const pageArticles = rows.results.slice(0, limit);

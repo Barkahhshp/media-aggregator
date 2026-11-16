@@ -164,7 +164,10 @@ export async function parseExportNdjson(ndjson: string): Promise<ParsedExport> {
     const sourceId = assertString(row.source_id, "article source id", 128);
     const contentHash = assertString(row.content_hash, "article content hash", 128);
     const contentText = decodeFullText(row.content_text_base64);
-    if (await sha256Hex(contentText) !== contentHash) {
+    const contentWasOmittedAsTooLarge = row.status === "content_too_large"
+      && contentText === ""
+      && /^[a-f0-9]{64}$/iu.test(contentHash);
+    if (await sha256Hex(contentText) !== contentHash && !contentWasOmittedAsTooLarge) {
       throw new Error(`Article content hash mismatch for ${id}`);
     }
     const { content_text_base64: _contentTextBase64, ...metadata } = row;
@@ -223,14 +226,16 @@ async function verifyRestoredArticles(db: D1Database, expected: Map<string, stri
   let verified = 0;
   while (true) {
     const rows = await db.prepare(`
-      SELECT id, content_text, content_hash
+      SELECT id, content_text, content_hash, status
       FROM articles WHERE id > ? ORDER BY id LIMIT 10
-    `).bind(cursor).all<{ id: string; content_text: string; content_hash: string }>();
+    `).bind(cursor).all<{ id: string; content_text: string; content_hash: string; status: string }>();
     const batchRows = rows.results ?? [];
     for (const row of batchRows) {
       const originalHash = expected.get(row.id);
       const computedHash = await sha256Hex(row.content_text);
-      if (!originalHash || row.content_hash !== originalHash || computedHash !== originalHash) {
+      const omittedTooLargeText = row.status === "content_too_large" && row.content_text === ""
+        && /^[a-f0-9]{64}$/iu.test(row.content_hash);
+      if (!originalHash || row.content_hash !== originalHash || (computedHash !== originalHash && !omittedTooLargeText)) {
         throw new Error(`Restored article content hash mismatch for ${row.id}`);
       }
       verified += 1;

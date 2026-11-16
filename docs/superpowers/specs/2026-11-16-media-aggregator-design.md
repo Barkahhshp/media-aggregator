@@ -111,13 +111,14 @@ Terapkan batas byte pada seluruh field sebelum menulis: `title` maks. 4 KiB, `su
 
 ## REST API
 
-Produksi memakai custom hostname yang diproteksi Cloudflare Access dengan Service Auth token; endpoint `workers.dev` dimatikan. Hanya request yang lolos policy Access yang mencapai Worker. Client internal mengirim service token headers; tidak ada aplikasi publik. Local dev memakai `API_TOKEN` lokal. API rate-limit per service token, dengan request body maksimum 32 KiB.
+Produksi memakai custom hostname yang diproteksi Cloudflare Access dengan Service Auth token; endpoint `workers.dev` dimatikan. Hanya request yang lolos policy Access yang mencapai Worker. Client internal mengirim service token headers; tidak ada aplikasi publik. Local dev memakai `API_TOKEN` lokal. API menerapkan 120 request/60 detik per service token melalui Worker Rate Limiting API, memakai hash dari identitas token yang tidak rahasia; batas Cloudflare bersifat approximate per-location, bukan kuota global strict. Request body maksimum 32 KiB.
 
 - `GET /health` — informasi hidup/minimal; endpoint ini juga hanya tersedia setelah Access.
-- `GET /v1/sources` — daftar sumber, interval, freshness, status dan backlog.
+- `GET /v1/status` — pending backlog aktif/nonaktif, umur item tertua, ukuran D1 terakhir, dan state storage.
+- `GET /v1/sources` — daftar sumber, interval, freshness, status, jumlah pending dan umur item pending tertua.
 - `POST /v1/sources` — tambah RSS/Atom/JSON Feed, sitemap, URL artikel, atau halaman daftar dengan selector.
 - `PATCH /v1/sources/:id` — ubah selector/interval atau enable/disable.
-- `DELETE /v1/sources/:id` — soft-disable; artikel tersimpan tidak dihapus.
+- `DELETE /v1/sources/:id` — soft-disable; artikel tersimpan tidak dihapus, pending backlog tetap tersimpan dan tidak di-claim sampai source diaktifkan kembali.
 - `GET /v1/articles?source_id=&from=&to=&q=&cursor=&limit=` — list dengan cursor; `from` inklusif UTC, `to` eksklusif UTC; `q` mencari judul/snippet; limit default 20, maksimum 100.
 - `GET /v1/articles/:id` — metadata dan teks penuh.
 - `POST /v1/exports` — mulai ekspor dan mengunci ingestion.
@@ -132,9 +133,9 @@ Ekspor berjalan dengan pause ingestion supaya halaman ekspor menjadi snapshot ya
 
 1. `POST /v1/exports` memperoleh global `export_lock` dan menetapkan batas snapshot/ID terakhir.
 2. Saat lock hidup, Cron menghentikan fetch/write artikel, dan perubahan source configuration mengembalikan `423 export_in_progress`.
-3. Page export diurutkan dengan immutable `article.id`, bukan `fetched_at`; semua record di bawah watermark tidak berubah selama ekspor.
+3. Page export diurutkan dengan immutable `article.id`, bukan `fetched_at`; semua record di bawah watermark tidak berubah selama ekspor. Artikel `content_too_large` menyimpan/export teks kosong tetapi mempertahankan hash body asal; restore menerima pengecualian ini berdasarkan status dan body kosong, karena body asal sengaja tidak tersimpan.
 4. Setiap halaman mencakup versi schema, sources, source state/watermark, semua pending/retryable dan terminal records yang belum dipangkas, articles, teks, serta cursor. Maksimal 10 record dan 3 MiB NDJSON setelah encoding; server berhenti sebelum batas byte tercapai, bukan memotong record. Client dapat menyimpan checkpoint dan melanjutkan halaman berikutnya.
-5. Ekspor selesai dengan `DELETE /v1/exports/:id`; lock otomatis habis setelah 30 menit. Ekspor kedaluwarsa harus dimulai ulang.
+5. Ekspor selesai dengan `DELETE /v1/exports/:id`; row sesi dihapus dan lock dibuka. Sesi aktif otomatis kedaluwarsa setelah 30 menit dan sesi stale/completed dibersihkan ketika ekspor berikutnya dimulai. Ekspor kedaluwarsa harus dimulai ulang.
 6. Uji ekspor penuh, restore ke database D1 lokal yang kosong, bandingkan row counts/hash/isi untuk sources, cursors/watermarks, pending backlog, dan articles; lakukan export sambil ada source updates untuk membuktikan lock mencegah kehilangan/duplikasi.
 
 D1 Time Travel Free memberi point-in-time restore tujuh hari; ekspor NDJSON adalah backup jangka panjang manual. Tidak ada backup data R2 karena R2 tidak dipakai.
@@ -169,7 +170,7 @@ Ribuan item teks muat selama masih di bawah cap 300 MB. Namun batas gratis bukan
 
 Tes wajib: feed/Atom/JSON valid, 304, lebih dari 2 item pending feed, lebih dari 10 URL sitemap, kandidat >10 yang masih akan ditemukan, new item during pending drain, pending deletion atomik dengan article+FTS, terminal pending purge setelah 30 hari, pending cap 2.000 rows/24 MiB, sustained overload sampai write gate menutup tanpa cursor skip dan ukuran D1 tetap di bawah 300 MiB, metadata/error field caps, body lengkap, selector hilang, 403/429/Retry-After, halaman dinamis, response 2 MiB, multi-hop/private/encoded redirect, host eksternal, lease race/reclaim, dedupe, FTS sync, D1 daily/storage limit, size_after/index accounting, UTF-8 field caps dan row gabungan dekat 1,800,000 bytes, Access auth/local token/secret redaction, stable cursor, export page ≤10 rows dan ≤3 MiB encoded dengan full-size bodies/pending metadata, export lock/pagination/expiry, export→restore termasuk sources/cursors/pending/articles, serta D1 failures.
 
-Setiap fitur memakai RED → GREEN → REFACTOR; jalankan seluruh test suite, lint, typecheck, dan build. Ukur CPU/pending throughput dengan fixture realistis; jika 10 ms Free terlewati, sederhanakan parsing atau kecilkan batch—jangan diam-diam mengandalkan plan berbayar.
+Setiap fitur memakai RED → GREEN → REFACTOR; jalankan seluruh test suite, lint, typecheck, dan build. Ukur CPU/pending throughput dengan fixture realistis; elapsed-time Workers runtime lokal bukan billed CPU time, jadi nyatakan batas itu dan jangan klaim perilaku produksi 10 ms tanpa ukur live. Jika 10 ms Free terlewati, sederhanakan parsing atau kecilkan batch—jangan diam-diam mengandalkan plan berbayar.
 
 ## Tahap kerja dan batas persetujuan
 

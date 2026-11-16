@@ -93,12 +93,12 @@ describe("article repository", () => {
 
     const seenIds: string[] = [];
     let cursor: string | undefined;
-    do {
+    for (let pageNumber = 0; pageNumber < 10; pageNumber += 1) {
       const page = await repository.listArticles(testEnv.DB, { limit: 2, ...(cursor === undefined ? {} : { cursor }) });
       seenIds.push(...page.articles.map((article) => String(article.id)));
       cursor = page.next_cursor ?? undefined;
       if (cursor === undefined) break;
-    } while (true);
+    }
 
     expect(seenIds).toEqual([
       "recent",

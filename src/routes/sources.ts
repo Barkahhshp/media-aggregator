@@ -86,6 +86,9 @@ function validatePatchShape(value: unknown): SourcePatchInput | ApiError {
   if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
     return { status: 400, code: "invalid_source_update", message: "enabled must be a boolean" };
   }
+  if ("poll_interval_sec" in value && typeof value.poll_interval_sec !== "number") {
+    return { status: 400, code: "invalid_source_update", message: "poll_interval_sec must be a number" };
+  }
   return value as SourcePatchInput;
 }
 
