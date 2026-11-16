@@ -199,6 +199,87 @@ describe("feed parsing", () => {
     expect(new Set(yieldedUrls).size).toBe(205);
   });
 
+  it("deduplicates_repeated_IDs_before_paging_and_keeps_the_first_candidate", async () => {
+    const module = await loadFeedParser();
+    if (!module) return;
+
+    const items = [
+      `<item><guid>repeated-id</guid><link>https://example.com/first-representation</link><title>First</title></item>`,
+      ...Array.from({ length: 98 }, (_, index) => {
+        const id = index + 1;
+        return `<item><guid>item-${id}</guid><link>https://example.com/item-${id}</link><title>Item ${id}</title></item>`;
+      }),
+      `<item><guid>repeated-id</guid><link>https://example.com/duplicate-representation</link><title>Duplicate</title></item>`,
+      ...[100, 101, 102].map((id) => `<item><guid>item-${id}</guid><link>https://example.com/item-${id}</link><title>Item ${id}</title></item>`),
+    ];
+    const body = `<rss><channel>${items.join("")}</channel></rss>`;
+    const yielded: Candidate[] = [];
+    let afterCursor: SourceCursor | undefined;
+    let hasMore = true;
+    let pageCount = 0;
+
+    while (hasMore) {
+      const page = module.parseFeed(body, "application/rss+xml", afterCursor);
+      pageCount += 1;
+      expect(page.cursorFound).toBe(true);
+      yielded.push(...page.candidates);
+      hasMore = page.hasMore;
+      afterCursor = page.nextCursor ?? undefined;
+      expect(pageCount).toBeLessThanOrEqual(2);
+    }
+
+    const expectedKeys = ["repeated-id", ...Array.from({ length: 98 }, (_, index) => `item-${index + 1}`), "item-100", "item-101", "item-102"];
+    expect(pageCount).toBe(2);
+    expect(yielded.map((candidate) => candidate.dedupeKey)).toEqual(expectedKeys);
+    expect(yielded).toHaveLength(102);
+    expect(yielded[0]?.canonicalUrl).toBe("https://example.com/first-representation");
+    expect(yielded.some((candidate) => candidate.canonicalUrl === "https://example.com/duplicate-representation")).toBe(false);
+  });
+
+  it("deduplicates_repeated_no_ID_URLs_before_paging_and_keeps_the_first_candidate", async () => {
+    const module = await loadFeedParser();
+    if (!module) return;
+
+    const items = [
+      `<item><link>https://example.com/no-id-0</link><title>First</title></item>`,
+      ...Array.from({ length: 98 }, (_, index) => {
+        const id = index + 1;
+        return `<item><link>https://example.com/no-id-${id}</link><title>Item ${id}</title></item>`;
+      }),
+      `<item><link>https://example.com/no-id-0</link><title>Duplicate</title></item>`,
+      ...[100, 101, 102].map((id) => `<item><link>https://example.com/no-id-${id}</link><title>Item ${id}</title></item>`),
+    ];
+    const body = `<rss><channel>${items.join("")}</channel></rss>`;
+    const yielded: Candidate[] = [];
+    let afterCursor: SourceCursor | undefined;
+    let hasMore = true;
+    let pageCount = 0;
+
+    while (hasMore) {
+      const page = module.parseFeed(body, "application/rss+xml", afterCursor);
+      pageCount += 1;
+      expect(page.cursorFound).toBe(true);
+      yielded.push(...page.candidates);
+      hasMore = page.hasMore;
+      afterCursor = page.nextCursor ?? undefined;
+      expect(pageCount).toBeLessThanOrEqual(2);
+    }
+
+    const expectedKeys = [
+      "https://example.com/no-id-0",
+      ...Array.from({ length: 98 }, (_, index) => `https://example.com/no-id-${index + 1}`),
+      "https://example.com/no-id-100",
+      "https://example.com/no-id-101",
+      "https://example.com/no-id-102",
+    ];
+    expect(pageCount).toBe(2);
+    expect(yielded.map((candidate) => candidate.dedupeKey)).toEqual(expectedKeys);
+    expect(yielded).toHaveLength(102);
+    expect(yielded[0]?.canonicalUrl).toBe("https://example.com/no-id-0");
+    expect(yielded[0]?.title).toBe("First");
+    expect(yielded.filter((candidate) => candidate.canonicalUrl === "https://example.com/no-id-0")).toHaveLength(1);
+  });
+
   it("restarts_from_the_first_page_when_the_saved_cursor_is_missing", async () => {
     const module = await loadFeedParser();
     if (!module) return;

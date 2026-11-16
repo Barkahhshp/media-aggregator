@@ -163,6 +163,15 @@ function jsonCandidates(body: string): Candidate[] {
   return output;
 }
 
+function deduplicateCandidatesByKey(candidates: Candidate[]): Candidate[] {
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    if (seen.has(candidate.dedupeKey)) return false;
+    seen.add(candidate.dedupeKey);
+    return true;
+  });
+}
+
 function pageCandidates(candidates: Candidate[], afterCursor?: SourceCursor): ParsedFeed {
   let cursorFound = afterCursor === undefined;
   let startIndex = 0;
@@ -201,5 +210,5 @@ export function parseFeed(body: string, contentType: string, afterCursor?: Sourc
           throw new Error("Unsupported XML feed root element");
       }
     })();
-  return pageCandidates(candidates, afterCursor);
+  return pageCandidates(deduplicateCandidatesByKey(candidates), afterCursor);
 }
