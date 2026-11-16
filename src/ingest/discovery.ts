@@ -2,6 +2,7 @@ import { normalizeAndValidateUrl } from "./url-policy";
 import { parseFeed } from "./feed-parser";
 import { parseSitemap } from "./sitemap-parser";
 import { enqueueCandidates, type EnqueueResult, type PendingBudget } from "./pending-repository";
+import { checkWriteGate, completeWriteReservation, D1_STORAGE_STOP_BYTES } from "./storage-guard";
 import type { Candidate } from "./types";
 import type { Source } from "../sources/types";
 
@@ -26,6 +27,10 @@ function canonicalHost(host: string): string {
 
 function markHostMismatch(candidate: Candidate, source: Source, pendingType: "article" | "sitemap"): DiscoveryCandidate {
   const bound: DiscoveryCandidate = { ...candidate, sourceId: source.id, pendingType };
+  if (candidate.terminalFailure !== undefined) {
+    bound.terminalFailure = candidate.terminalFailure;
+    return bound;
+  }
   try {
     const parsed = normalizeAndValidateUrl(candidate.canonicalUrl);
     if (canonicalHost(parsed.hostname) !== canonicalHost(source.host)) {
@@ -50,11 +55,24 @@ async function resetCursor(
   sourceId: string,
   column: "feed_watermark" | "sitemap_last_loc",
   expectedValue: string,
-): Promise<boolean> {
-  const row = await db.prepare(
-    `UPDATE sources SET ${column} = NULL, updated_at = ? WHERE id = ? AND ${column} = ? RETURNING id`,
-  ).bind(Math.floor(Date.now() / 1000), sourceId, expectedValue).first<{ id: string }>();
-  return row !== null;
+): Promise<{ reset: boolean; storageLimit: boolean }> {
+  const now = Math.floor(Date.now() / 1000);
+  const reservation = await checkWriteGate(db, "pending", 1024);
+  if (reservation === "storage_limit") return { reset: false, storageLimit: true };
+
+  let sizeAfter = reservation.measuredSize;
+  try {
+    const result = await db.prepare(
+      `UPDATE sources SET ${column} = NULL, updated_at = ? WHERE id = ? AND ${column} = ? RETURNING id`,
+    ).bind(now, sourceId, expectedValue).run<{ id: string }>();
+    sizeAfter = result.meta.size_after;
+    return {
+      reset: (result.results?.length ?? 0) > 0,
+      storageLimit: sizeAfter >= D1_STORAGE_STOP_BYTES,
+    };
+  } finally {
+    await completeWriteReservation(db, reservation.id, sizeAfter, now);
+  }
 }
 
 function fallbackResult(cursorFound: boolean, hasMore: boolean, stopReason: EnqueueResult["stopReason"]): DiscoveryResult {
@@ -87,12 +105,12 @@ export async function discoverSource(
       : { kind: "feed" as const, value: source.feed_watermark };
     const parsed = parseFeed(body, contentType, afterCursor);
     if (parsed.candidates.length === 0) {
-      const cursorReset = parsed.cursorFound && source.feed_watermark !== null
+      const reset = parsed.cursorFound && source.feed_watermark !== null
         ? await resetCursor(db, source.id, "feed_watermark", source.feed_watermark)
-        : false;
+        : { reset: false, storageLimit: false };
       return {
-        ...fallbackResult(parsed.cursorFound, false, null),
-        cursorReset,
+        ...fallbackResult(parsed.cursorFound, reset.storageLimit && !reset.reset, reset.storageLimit ? "storage_limit" : null),
+        cursorReset: reset.reset,
       };
     }
 
@@ -120,12 +138,12 @@ export async function discoverSource(
     const startIndex = savedCursor === undefined || cursorIndex < 0 ? 0 : cursorIndex + 1;
     const remaining = parsed.locations.slice(startIndex);
     if (remaining.length === 0) {
-      const cursorReset = cursorFound && source.sitemap_last_loc !== null
+      const reset = cursorFound && source.sitemap_last_loc !== null
         ? await resetCursor(db, source.id, "sitemap_last_loc", source.sitemap_last_loc)
-        : false;
+        : { reset: false, storageLimit: false };
       return {
-        ...fallbackResult(cursorFound, false, null),
-        cursorReset,
+        ...fallbackResult(cursorFound, reset.storageLimit && !reset.reset, reset.storageLimit ? "storage_limit" : null),
+        cursorReset: reset.reset,
       };
     }
 
@@ -140,6 +158,7 @@ export async function discoverSource(
       author: null,
       publishedAt: location.lastModified,
       sourceCursor: location.sourceCursor,
+      terminalFailure: location.terminalFailure,
     }, source, parsed.isIndex ? "sitemap" : "article"));
     const stored = await enqueueCandidates(db, source, candidates, budget);
     return {

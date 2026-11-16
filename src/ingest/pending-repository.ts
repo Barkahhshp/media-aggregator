@@ -2,12 +2,14 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { normalizePublishedAt } from "./feed-parser";
 import { MAX_SOURCE_CURSOR_BYTES, stableCursorValue } from "./cursor";
+import { checkWriteGate, completeWriteReservation, D1_STORAGE_STOP_BYTES } from "./storage-guard";
 import type { Candidate, SourceCursor } from "./types";
 import type { Source } from "../sources/types";
 
 export const MAX_PENDING_ROWS = 2_000;
 export const MAX_PENDING_METADATA_BYTES = 24 * 1024 * 1024;
 export const MAX_PENDING_INSERTS_PER_CALL = 10;
+export const MAX_PENDING_CHECKS_PER_CALL = 25;
 export const PENDING_LEASE_SECONDS = 120;
 export const TERMINAL_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 
@@ -18,6 +20,7 @@ const MAX_TITLE_BYTES = 4 * 1024;
 const MAX_SUMMARY_BYTES = 1024;
 const MAX_PUBLISHED_AT_BYTES = 64;
 const MAX_ERROR_BYTES = 1024;
+const ESTIMATED_PENDING_GROWTH_PER_CANDIDATE_BYTES = 64 * 1024;
 const PENDING_HASH_PREFIX = "__cue_pending_sha256_v1__:";
 const OVERFLOW_URL_PREFIX = "https://metadata.invalid/sha256/";
 
@@ -37,7 +40,7 @@ export interface EnqueueResult {
   blocked: number;
   lastAccountedCursor: SourceCursor | null;
   hasMore: boolean;
-  stopReason: "max_candidates" | "pending_limit" | "metadata_limit" | "invalid_cursor" | "unsupported_source" | null;
+  stopReason: "max_candidates" | "query_limit" | "pending_limit" | "metadata_limit" | "storage_limit" | "invalid_cursor" | "unsupported_source" | null;
 }
 
 export interface PendingItem {
@@ -248,19 +251,34 @@ export async function enqueueCandidates(
   const maxTotalRows = Math.max(0, Math.min(MAX_PENDING_ROWS, budget.maxTotalRows ?? MAX_PENDING_ROWS));
   const maxBytes = Math.max(0, Math.min(MAX_PENDING_METADATA_BYTES, budget.maxSerializedBytes ?? MAX_PENDING_METADATA_BYTES));
   const now = Math.floor(Date.now() / 1000);
+  const candidatesToCheck = Math.min(candidates.length, MAX_PENDING_CHECKS_PER_CALL);
+  if (candidatesToCheck === 0) return result;
 
-  for (let index = 0; index < candidates.length; index += 1) {
-    const candidate = candidates[index] as PendingCandidate;
-    const prepared = prepareCandidate(source, candidate, now);
-    const cursorUpdate = cursorUpdateStatement(db, source, prepared);
-    if (cursorUpdate === null) {
-      result.hasMore = true;
-      result.stopReason = "invalid_cursor";
-      break;
-    }
+  const reservation = await checkWriteGate(
+    db,
+    "pending",
+    candidatesToCheck * ESTIMATED_PENDING_GROWTH_PER_CANDIDATE_BYTES,
+  );
+  if (reservation === "storage_limit") {
+    result.hasMore = true;
+    result.stopReason = "storage_limit";
+    return result;
+  }
 
-    const cursor = candidate.sourceCursor;
-    const insert = db.prepare(`
+  let latestSize = reservation.measuredSize;
+  try {
+    for (let index = 0; index < candidatesToCheck; index += 1) {
+      const candidate = candidates[index] as PendingCandidate;
+      const prepared = prepareCandidate(source, candidate, now);
+      const cursorUpdate = cursorUpdateStatement(db, source, prepared);
+      if (cursorUpdate === null) {
+        result.hasMore = true;
+        result.stopReason = "invalid_cursor";
+        break;
+      }
+
+      const cursor = candidate.sourceCursor;
+      const insert = db.prepare(`
       INSERT OR IGNORE INTO pending_items (
         id, source_id, item_type, dedupe_key, external_id, canonical_url,
         title, summary, published_at, status, last_error, terminal_expires_at
@@ -320,38 +338,52 @@ export async function enqueueCandidates(
       prepared.canonicalUrl,
     );
 
-    const batch = await db.batch([insert, cursorUpdate]);
-    const inserted = (batch[0]?.results.length ?? 0) > 0;
-    const accounted = (batch[1]?.results.length ?? 0) > 0;
-    if (!inserted && !accounted) {
-      const stats = await pendingStats(db);
-      result.hasMore = true;
-      if (stats.count >= maxTotalRows) result.stopReason = "pending_limit";
-      else if (stats.bytes + prepared.serializedBytes > maxBytes) result.stopReason = "metadata_limit";
-      else if (result.inserted >= maxNewRows) result.stopReason = "max_candidates";
-      else result.stopReason = "invalid_cursor";
-      break;
-    }
-    if (!accounted) {
-      result.hasMore = true;
-      result.stopReason = "invalid_cursor";
-      break;
-    }
+      const batch = await db.batch([insert, cursorUpdate]);
+      latestSize = batch[1]?.meta.size_after ?? batch[0]?.meta.size_after ?? latestSize;
+      const inserted = (batch[0]?.results?.length ?? 0) > 0;
+      const accounted = (batch[1]?.results?.length ?? 0) > 0;
+      if (!inserted && !accounted) {
+        const stats = await pendingStats(db);
+        result.hasMore = true;
+        if (stats.count >= maxTotalRows) result.stopReason = "pending_limit";
+        else if (stats.bytes + prepared.serializedBytes > maxBytes) result.stopReason = "metadata_limit";
+        else if (result.inserted >= maxNewRows) result.stopReason = "max_candidates";
+        else result.stopReason = "invalid_cursor";
+        break;
+      }
+      if (!accounted) {
+        result.hasMore = true;
+        result.stopReason = "invalid_cursor";
+        break;
+      }
 
-    if (inserted) {
-      result.inserted += 1;
-      if (prepared.status === "failed") result.failed += 1;
-      if (prepared.status === "blocked") result.blocked += 1;
-    } else {
-      result.deduplicated += 1;
+      if (inserted) {
+        result.inserted += 1;
+        if (prepared.status === "failed") result.failed += 1;
+        if (prepared.status === "blocked") result.blocked += 1;
+      } else {
+        result.deduplicated += 1;
+      }
+      if (cursor !== null) result.lastAccountedCursor = { kind: cursor.kind, value: cursor.value };
+      if (latestSize >= D1_STORAGE_STOP_BYTES) {
+        result.stopReason = "storage_limit";
+        result.hasMore = index + 1 < candidates.length || candidates.length > candidatesToCheck;
+        break;
+      }
     }
-    if (cursor !== null) result.lastAccountedCursor = { kind: cursor.kind, value: cursor.value };
-
-  }
-  if (result.stopReason === "pending_limit" || result.stopReason === "metadata_limit") {
-    await db.prepare("UPDATE sources SET last_status = 'storage_limit', updated_at = ? WHERE id = ?")
-      .bind(now, source.id)
-      .run();
+    if (result.stopReason === null && candidates.length > candidatesToCheck) {
+      result.hasMore = true;
+      result.stopReason = "query_limit";
+    }
+    if (result.stopReason === "pending_limit" || result.stopReason === "metadata_limit") {
+      const status = await db.prepare("UPDATE sources SET last_status = 'storage_limit', updated_at = ? WHERE id = ?")
+        .bind(now, source.id)
+        .run();
+      latestSize = status.meta.size_after;
+      if (latestSize >= D1_STORAGE_STOP_BYTES) result.stopReason = "storage_limit";
+    }
+  } finally {
+    await completeWriteReservation(db, reservation.id, latestSize);
   }
   return result;
 }

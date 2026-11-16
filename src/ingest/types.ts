@@ -13,6 +13,7 @@ export interface Candidate {
   author: string | null;
   publishedAt: string | null;
   sourceCursor: SourceCursor | null;
+  terminalFailure?: { status: "blocked" | "failed"; code: string; message: string };
 }
 
 export interface FetchLimits {
@@ -34,18 +35,21 @@ export interface ParsedFeed {
   hasMore: boolean;
   cursorFound: boolean;
   nextCursor: SourceCursor | null;
+  rejectedCount: number;
 }
 
 export interface ParsedSitemap {
   locations: SitemapLocation[];
   isIndex: boolean;
   nextCursor: SourceCursor | null;
+  rejectedCount: number;
 }
 
 export interface SitemapLocation {
   url: string;
   lastModified: string | null;
   sourceCursor: SourceCursor;
+  terminalFailure?: { status: "blocked" | "failed"; code: string; message: string };
 }
 
 export interface ExtractedArticle {

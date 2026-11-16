@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { stableCursorValue } from "./cursor";
 import { normalizeAndValidateUrl } from "./url-policy";
 import type { Candidate, ParsedFeed, SourceCursor } from "./types";
@@ -5,6 +7,23 @@ import { childrenNamed, firstChild, firstChildText, localName, nodeText, parseXm
 
 const MAX_FEED_BYTES = 2 * 1024 * 1024;
 const MAX_FEED_CANDIDATES = 100;
+const UNSAFE_IDENTITY_PREFIX = "__cue_unsafe_sha256_v1__:";
+const SAFE_IDENTITY_PREFIX = "__cue_safe_id_sha256_v1__:";
+const SAFE_METADATA_URL_PREFIX = "https://metadata.invalid/sha256/";
+
+function hashedIdentity(value: string): string {
+  return `${UNSAFE_IDENTITY_PREFIX}${bytesToHex(sha256(new TextEncoder().encode(value)))}`;
+}
+
+function safeMetadataUrl(value: string): string {
+  return `${SAFE_METADATA_URL_PREFIX}${bytesToHex(sha256(new TextEncoder().encode(value)))}`;
+}
+
+function persistedIdentity(value: string): string {
+  return value.startsWith(UNSAFE_IDENTITY_PREFIX)
+    ? `${SAFE_IDENTITY_PREFIX}${bytesToHex(sha256(new TextEncoder().encode(value)))}`
+    : value;
+}
 
 function hasValidCalendarDate(year: number, month: number, day: number): boolean {
   if (month < 1 || month > 12) return false;
@@ -51,9 +70,24 @@ function candidate(
   try {
     canonicalUrl = normalizeAndValidateUrl(item.url).href;
   } catch {
-    return null;
+    const identity = hashedIdentity(externalId ?? item.url);
+    return {
+      dedupeKey: identity,
+      canonicalUrl: safeMetadataUrl(item.url),
+      externalId: null,
+      title: null,
+      summary: null,
+      author: null,
+      publishedAt: null,
+      sourceCursor: { kind: "feed", value: stableCursorValue(identity) },
+      terminalFailure: {
+        status: "blocked",
+        code: "blocked_unsafe_url",
+        message: "Candidate URL is not a permitted public URL",
+      },
+    };
   }
-  const identity = externalId ?? canonicalUrl;
+  const identity = persistedIdentity(externalId ?? canonicalUrl);
   const cursor: SourceCursor = { kind: "feed", value: stableCursorValue(identity) };
   return {
     dedupeKey: identity,
@@ -105,7 +139,8 @@ function atomCandidates(root: XmlNode): Candidate[] {
   const output: Candidate[] = [];
   for (const entry of entries) {
     const id = firstChildText(entry, "id");
-    const url = atomLink(entry) || id;
+    const alternateUrl = atomLink(entry);
+    const url = alternateUrl || (id.includes("://") ? id : "");
     if (url.length === 0) continue;
     const author = firstChild(entry, "author");
     const parsed = candidate({
@@ -191,6 +226,7 @@ function pageCandidates(candidates: Candidate[], afterCursor?: SourceCursor): Pa
     hasMore: startIndex + page.length < candidates.length,
     cursorFound,
     nextCursor: page[page.length - 1]?.sourceCursor ?? null,
+    rejectedCount: page.filter((candidate) => candidate.terminalFailure !== undefined).length,
   };
 }
 

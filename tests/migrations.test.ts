@@ -70,4 +70,18 @@ describe("initial D1 migration", () => {
         .run(),
     ).rejects.toThrow(/CHECK constraint failed/);
   });
+
+  it("creates_the_shared_storage_write_reservation_state", async () => {
+    await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);
+
+    const columns = await testEnv.DB.prepare("PRAGMA table_info(system_state)").all<{ name: string }>();
+    const reservationTable = await testEnv.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'storage_write_reservations'")
+      .first<{ name: string }>();
+    const reservationIndex = await testEnv.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_storage_reservations_expiry'")
+      .first<{ name: string }>();
+
+    expect(columns.results.map((column) => column.name)).toContain("reserved_db_bytes");
+    expect(reservationTable?.name).toBe("storage_write_reservations");
+    expect(reservationIndex?.name).toBe("idx_storage_reservations_expiry");
+  });
 });

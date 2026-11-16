@@ -2,9 +2,15 @@ import { describe, expect, it } from "vitest";
 
 interface SitemapParserModule {
   parseSitemap(body: string): {
-    locations: Array<{ url: string; lastModified: string | null; sourceCursor: { kind: "sitemap"; value: string } }>;
+    locations: Array<{
+      url: string;
+      lastModified: string | null;
+      sourceCursor: { kind: "sitemap"; value: string };
+      terminalFailure?: { status: "blocked" | "failed"; code: string; message: string };
+    }>;
     isIndex: boolean;
     nextCursor: { kind: "sitemap"; value: string } | null;
+    rejectedCount: number;
   };
 }
 
@@ -20,6 +26,26 @@ async function loadParseSitemap() {
 }
 
 describe("sitemap parsing", () => {
+  it("returns_unsafe_locations_as_bounded_terminal_records_without_the_raw_URL", async () => {
+    const parseSitemap = await loadParseSitemap();
+    if (!parseSitemap) return;
+
+    const unsafeUrl = "http://127.0.0.1/private?token=do-not-store";
+    const result = parseSitemap(`<urlset><url><loc>${unsafeUrl}</loc><lastmod>2026-11-15</lastmod></url><url><loc>https://example.com/safe</loc></url></urlset>`);
+    const rejected = result.locations[0];
+
+    expect(result.rejectedCount).toBe(1);
+    expect(result.locations).toHaveLength(2);
+    expect(rejected).toMatchObject({
+      url: expect.stringMatching(/^https:\/\/metadata\.invalid\/sha256\/[a-f0-9]{64}$/),
+      lastModified: null,
+      terminalFailure: { status: "blocked", code: "blocked_unsafe_url" },
+    });
+    expect(rejected?.sourceCursor.value.length).toBeLessThanOrEqual(4096);
+    expect(JSON.stringify(rejected)).not.toContain(unsafeUrl);
+    expect(result.nextCursor).toEqual(result.locations[1]?.sourceCursor);
+  });
+
   it("preserves_more_than_100_urlset_locations_for_cursorable_batching", async () => {
     const parseSitemap = await loadParseSitemap();
     if (!parseSitemap) return;

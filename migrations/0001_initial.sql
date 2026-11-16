@@ -84,6 +84,7 @@ CREATE TABLE system_state (
   global_lease_token TEXT,
   global_lease_expires_at INTEGER,
   observed_db_size INTEGER NOT NULL DEFAULT 0 CHECK (observed_db_size >= 0),
+  reserved_db_bytes INTEGER NOT NULL DEFAULT 0 CHECK (reserved_db_bytes >= 0),
   storage_state TEXT NOT NULL DEFAULT 'normal' CHECK (storage_state IN ('normal', 'storage_limit', 'read_only')),
   export_lock INTEGER NOT NULL DEFAULT 0 CHECK (export_lock IN (0, 1)),
   export_lock_id TEXT,
@@ -93,6 +94,14 @@ CREATE TABLE system_state (
       OR (global_lease_token IS NOT NULL AND global_lease_expires_at IS NOT NULL)),
   CHECK ((export_lock = 0 AND export_lock_id IS NULL AND export_lock_expires_at IS NULL)
       OR (export_lock = 1 AND export_lock_id IS NOT NULL AND export_lock_expires_at IS NOT NULL))
+) STRICT;
+
+CREATE TABLE storage_write_reservations (
+  reservation_id TEXT PRIMARY KEY NOT NULL CHECK (length(reservation_id) BETWEEN 1 AND 128),
+  write_kind TEXT NOT NULL CHECK (write_kind IN ('pending', 'article', 'source', 'run')),
+  reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes > 0),
+  expires_at INTEGER NOT NULL CHECK (expires_at > 0),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
 
 CREATE TABLE export_sessions (
@@ -118,6 +127,7 @@ CREATE INDEX idx_articles_source_published ON articles (source_id, published_at 
 CREATE INDEX idx_fetch_runs_started ON fetch_runs (started_at DESC, id DESC);
 CREATE INDEX idx_fetch_runs_source_started ON fetch_runs (source_id, started_at DESC, id DESC);
 CREATE INDEX idx_export_sessions_expires ON export_sessions (expires_at, state);
+CREATE INDEX idx_storage_reservations_expiry ON storage_write_reservations (expires_at);
 
 CREATE VIRTUAL TABLE articles_fts USING fts5 (
   article_id UNINDEXED,

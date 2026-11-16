@@ -18,8 +18,9 @@
 - REST list defaults to 20 items and caps at 100; article pagination is stable, cursor-based; article detail returns full text.
 - Full text is at most 500 KiB UTF-8 per article. Aggregate D1 row content must remain below 1,800,000 bytes; reject with `row_too_large`.
 - Stop ingestion at 280 MiB physical D1 size; absolute application cap is 300 MiB. Measure with D1 `meta.size_after` including indexes/FTS.
+- Cloudflare Free D1 allows at most 50 queries per Worker invocation; bound duplicate accounting as well as new inserts so `db.batch()` use remains under that limit.
 - Pending backlog maximum is 2,000 rows and 24 MiB serialized metadata. Pending text/URL fields obey design caps; successful pending rows are deleted atomically with article/FTS upsert; terminal failures expire after 30 days.
-- At most one source is scheduled per invocation, one feed/sitemap fetch plus two article fetches, and at most 10 newly persisted candidates per invocation. Do not advance any cursor beyond successfully persisted candidates.
+- At most one source is scheduled per invocation, one feed/sitemap fetch plus two article fetches, at most 10 newly persisted candidates, and at most 25 candidates checked/accounted per invocation. Do not advance any cursor beyond successfully persisted or deduplicated candidates.
 - Allow at most 100 active sources; default polling interval is two hours, minimum 15 minutes; freshness is best-effort, not an SLA.
 - Fetch only HTTP/HTTPS ports 80/443; manually validate redirects, same-host only, maximum 3 hops; reject private/reserved/local targets and URLs with userinfo.
 - Use Cloudflare Access in production; local/test uses an explicit local Bearer token. Never log auth material.
@@ -103,38 +104,42 @@
 ### Task 4: Durable discovery backlog and cursor management
 
 **Files:**
-- Create: `src/ingest/pending-repository.ts`, `src/ingest/discovery.ts`
-- Test: `tests/pending-repository.test.ts`, `tests/discovery.test.ts`
+- Create: `src/ingest/pending-repository.ts`, `src/ingest/discovery.ts`, `src/ingest/storage-guard.ts`
+- Modify: `src/ingest/feed-parser.ts`, `src/ingest/sitemap-parser.ts`, `src/ingest/types.ts`, `migrations/0001_initial.sql`
+- Test: `tests/pending-repository.test.ts`, `tests/discovery.test.ts`, `tests/feed-parser.test.ts`, `tests/sitemap-parser.test.ts`, `tests/migrations.test.ts`, `tests/storage-guard.test.ts`
 
 **Interfaces:**
 - `enqueueCandidates(db: D1Database, source: Source, candidates: Candidate[], budget: PendingBudget): Promise<EnqueueResult>` atomically persists no more than 10 rows, 2,000 total rows, or 24 MiB serialized pending metadata and returns the last safely accounted cursor (newly persisted or already present via dedupe).
+- Shared `checkWriteGate(db, writeKind, estimatedBytes)` measures D1 `meta.size_after` and creates an expiring reservation against the 280 MiB stop/300 MiB hard cap; `completeWriteReservation` records post-write `meta.size_after` and releases it. Task 5 reuses this API for `article`, `source`, and `run` writers and adds the global lease.
 - `claimPending(db: D1Database, now: number, leaseToken: string): Promise<PendingItem | null>` claims the oldest eligible pending row.
 - `markPendingFailure(db: D1Database, item: PendingItem, outcome: PendingFailure): Promise<void>` records bounded retryable or terminal failure state without dropping a candidate.
-- `discoverSource` attaches the source ID, passes the last safely accounted feed cursor to `parseFeed`, stores candidates only from the same source host, and applies pending metadata byte caps before enqueue; if the saved cursor is absent, it restarts from the first page and relies on dedupe. If a valid cursor yields no candidates, reset the feed cursor to null for the next poll.
+- `discoverSource` attaches the source ID, passes the last safely accounted feed cursor to `parseFeed`, stores same-host candidates, records safe cross-host URLs as terminal `blocked_external_host`, and persists unsafe parser entries as bounded terminal `blocked_unsafe_url` rows without raw unsafe URL data. Parser results expose rejected counts. Cursor advancement requires persistence/dedupe; if capacity blocks persistence, hold the cursor. Missing feed cursors restart from page one and rely on dedupe; valid cursors reset only after an empty parse page.
+- Examine at most 25 candidates (including duplicates) per invocation so candidate-level batches plus gate queries remain below D1 Free's 50-query invocation limit; resume from the last accounted cursor.
 
-- [ ] **Step 1: Write failing tests** for >10 candidates, >100 feed pagination through all retained items across 10-item storage invocations, missing-cursor restart/dedupe, feed cursor reset only after an empty page, cross-host feed URLs never enqueued, oversized metadata rejection, full pending caps, cursor advancement only after persist/dedupe, no cursor advancement when the next candidate cannot fit, candidate overlap dedupe, and terminal-row expiry.
+- [ ] **Step 1: Write failing tests** for >10 candidates, >100 feed pagination across storage invocations, missing-cursor restart/dedupe, empty-page-only feed cursor reset, cross-host and unsafe terminal outcomes, no raw unsafe URL persistence, physical-size observation and 280/300 MiB gates/reservations, the ≤50 query/batch budget with duplicate-heavy pagination, oversized metadata, pending caps, cursor advancement only after persistence/dedupe, hold-on-capacity-failure, overlap dedupe, and terminal expiry.
 - [ ] **Step 2: Run focused tests and verify RED.**
-- [ ] **Step 3: Implement pending repository and discovery, per-field metadata byte caps, same-host candidate validation, paginated feed cursor resume/reset, pending-cap accounting, durable cursor writes in the same D1 batch, and terminal-row cleanup.** Keep retryable rows; retain terminal `blocked/failed` rows for 30 days. Article completion remains Task 5's responsibility.
+- [ ] **Step 3: Implement the shared measured-size reservation gate and pending path, expose rejected parser entries, and implement discovery persistence with metadata caps, same-host validation, cursor resume/reset, pending-cap accounting, ≤25 candidate checks per invocation, atomic pending/cursor writes, and terminal cleanup.** Keep retryable rows; retain terminal `blocked/failed` rows for 30 days. Task 5 extends the same gate to article/source/run writes under the global lease; article completion remains Task 5's responsibility.
 - [ ] **Step 4: Run focused tests and full `npm test`; verify GREEN.**
 - [ ] **Step 5: Run typecheck/build; commit `feat: persist discovery backlog and cursors`.**
 
 ### Task 5: Scheduled ingestion, article storage, and D1 write gate
 
 **Files:**
-- Create: `src/ingest/scheduler.ts`, `src/ingest/article-store.ts`, `src/ingest/storage-guard.ts`, `src/ingest/fetch-source.ts`, `src/articles/types.ts`
+- Create: `src/ingest/scheduler.ts`, `src/ingest/article-store.ts`, `src/ingest/fetch-source.ts`, `src/articles/types.ts`
+- Modify: `src/ingest/storage-guard.ts`
 - Modify: `src/index.ts`, `src/env.ts`, `wrangler.jsonc`, `src/ingest/pending-repository.ts`, `src/routes/sources.ts`
 - Test: `tests/scheduler.test.ts`, `tests/article-store.test.ts`, `tests/storage-guard.test.ts`
 
 **Interfaces:**
 - `runScheduled(env: Env, scheduledTime: number): Promise<ScheduleResult>` processes one source and at most two pending article URLs; it respects one global lease.
-- `checkWriteGate(db: D1Database, writeKind: 'pending' | 'article' | 'source' | 'run', estimatedBytes: number): Promise<'allow' | 'storage_limit'>` uses `meta.size_after`, stops all ingestion writes at 280 MiB and enters read-only growth mode by 300 MiB.
+- `checkWriteGate(db: D1Database, writeKind: 'pending' | 'article' | 'source' | 'run', estimatedBytes: number): Promise<WriteReservation | 'storage_limit'>` uses `meta.size_after`, reserves estimated growth against concurrent gated writes, stops at 280 MiB and enters read-only growth mode by 300 MiB; writers release reservations after writes with the actual `meta.size_after`.
 - `Article` and `ArticleInput` are defined in `src/articles/types.ts`; `saveArticleAndCompletePending(db: D1Database, item: PendingItem, article: ArticleInput): Promise<SaveArticleResult>` calls `normalizePublishedAt` from Task 3, applies field caps including the 64-byte timestamp cap, combined-row cap 1,800,000 bytes, D1 unique constraints, FTS update, dedupe, and pending deletion in one D1 transaction.
 - `leaseToken` must match before committing fetched results; expired global/pending leases may be reclaimed.
 - `runScheduled` checks `system_state.export_lock` before any discovery or write. The source POST route calls `checkWriteGate(..., 'source', bytes)` before inserting; it rejects additions while ingestion is paused or storage-limited.
 
 - [ ] **Step 1: Write failing tests** for scheduled source selection, feed/sitemap discovery, max one source + two article fetches, backlog priority, retry/backoff, `Retry-After`, concurrent Cron lease, `blocked` status, article limits, pending completion atomicity, and sustained D1 overload.
 - [ ] **Step 2: Run focused tests and verify RED.**
-- [ ] **Step 3: Implement scheduler, global lease, full-text article fetch, D1 transactional persistence, row/index caps, 280/300 MiB write gates for pending/articles/source/run, and fetch-run logging.** Reject new sources and discovery at the gate; allow only read/export/disable/delete operations.
+- [ ] **Step 3: Extend the Task 4 storage gate to article/source/run writes, then implement scheduler, global lease, full-text article fetch, D1 transactional persistence, row/index caps, and fetch-run logging.** Reject new sources and discovery at the gate; allow only read/export/disable/delete operations.
 - [ ] **Step 4: Run focused tests and full `npm test`; verify GREEN.** Add a stress fixture proving D1 physical size remains under 300 MiB and no cursor passes an unpersisted item under sustained overload.
 - [ ] **Step 5: Run typecheck/build; commit `feat: ingest feeds and store bounded full text`.**
 

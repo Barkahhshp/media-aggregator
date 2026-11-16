@@ -16,6 +16,7 @@ interface DiscoveryResult {
   cursorFound: boolean;
   cursorReset: boolean;
   blocked: number;
+  stopReason: string | null;
 }
 
 interface DiscoveryModule {
@@ -41,6 +42,7 @@ interface PendingRow {
   summary: string | null;
   published_at: string | null;
   status: string;
+  last_error: string | null;
 }
 
 const testEnv = env as unknown as TestBindings;
@@ -88,7 +90,7 @@ function rss(items: Array<{ id: string; url: string; title?: string }>): string 
 }
 
 async function rowsForSource(sourceId: string): Promise<PendingRow[]> {
-  const result = await testEnv.DB.prepare("SELECT source_id, item_type, dedupe_key, external_id, canonical_url, title, summary, published_at, status FROM pending_items WHERE source_id = ? ORDER BY discovered_at, id")
+  const result = await testEnv.DB.prepare("SELECT source_id, item_type, dedupe_key, external_id, canonical_url, title, summary, published_at, status, last_error FROM pending_items WHERE source_id = ? ORDER BY discovered_at, id")
     .bind(sourceId)
     .all<PendingRow>();
   return result.results;
@@ -100,6 +102,120 @@ beforeEach(async () => {
 });
 
 describe("source discovery", () => {
+  it("persists_unsafe_feed_URL_as_a_bounded_blocked_record_and_advances_after_accounting", async () => {
+    const discovery = await loadDiscovery();
+    if (!discovery) return;
+    const source = await makeSource();
+    const unsafeUrl = "http://127.0.0.1/private?token=do-not-store";
+
+    const result = await discovery.discoverSource(testEnv.DB, source, rss([
+      { id: "before", url: "https://example.com/before" },
+      { id: "unsafe", url: unsafeUrl },
+      { id: "after", url: "https://example.com/after" },
+    ]), "application/rss+xml");
+
+    const saved = await rowsForSource(source.id);
+    const unsafe = saved.find((row) => row.last_error?.includes("blocked_unsafe_url"));
+    expect(result.blocked).toBe(1);
+    expect(saved).toHaveLength(3);
+    expect(unsafe).toMatchObject({
+      status: "blocked",
+      canonical_url: expect.stringMatching(/^https:\/\/metadata\.invalid\/sha256\/[a-f0-9]{64}$/),
+    });
+    expect(JSON.stringify(unsafe)).not.toContain(unsafeUrl);
+    expect(await getSource(testEnv.DB, source.id)).toMatchObject({ feed_watermark: "after" });
+  });
+
+  it("holds_the_feed_cursor_at_an_unsafe_candidate_until_its_terminal_record_fits", async () => {
+    const discovery = await loadDiscovery();
+    if (!discovery) return;
+    const source = await makeSource();
+    const unsafeUrl = "http://127.0.0.1/private?token=do-not-store";
+
+    const result = await discovery.discoverSource(testEnv.DB, source, rss([
+      { id: "unsafe", url: unsafeUrl },
+      { id: "after", url: "https://example.com/after" },
+    ]), "application/rss+xml", { maxSerializedBytes: 1 });
+
+    expect(result.blocked).toBe(0);
+    expect(result.hasMore).toBe(true);
+    expect(result.stopReason).toBe("metadata_limit");
+    expect(result.lastAccountedCursor).toBeNull();
+    expect(await rowsForSource(source.id)).toHaveLength(0);
+    expect(await getSource(testEnv.DB, source.id)).toMatchObject({ feed_watermark: null });
+  });
+
+  it("persists_unsafe_sitemap_locations_as_terminal_blocked_records", async () => {
+    const discovery = await loadDiscovery();
+    if (!discovery) return;
+    const source = await makeSource("sitemap");
+    const unsafeUrl = "http://127.0.0.1/private?token=do-not-store";
+
+    const result = await discovery.discoverSource(testEnv.DB, source,
+      `<urlset><url><loc>${unsafeUrl}</loc></url><url><loc>https://example.com/safe</loc></url></urlset>`,
+      "application/xml");
+
+    const saved = await rowsForSource(source.id);
+    const unsafe = saved.find((row) => row.last_error?.includes("blocked_unsafe_url"));
+    expect(result.blocked).toBe(1);
+    expect(saved).toHaveLength(2);
+    expect(unsafe).toMatchObject({ status: "blocked", item_type: "article" });
+    expect(unsafe?.canonical_url).toMatch(/^https:\/\/metadata\.invalid\/sha256\/[a-f0-9]{64}$/);
+    expect(JSON.stringify(unsafe)).not.toContain(unsafeUrl);
+    expect(await getSource(testEnv.DB, source.id)).toMatchObject({ sitemap_last_loc: "https://example.com/safe" });
+  });
+
+  it("keeps_an_unsafe_sitemap_terminal_row_out_of_the_claimable_backlog", async () => {
+    const discovery = await loadDiscovery();
+    if (!discovery) return;
+    const source = await makeSource("sitemap");
+
+    const result = await discovery.discoverSource(testEnv.DB, source,
+      "<urlset><url><loc>http://127.0.0.1/private</loc></url></urlset>", "application/xml");
+
+    expect(result.blocked).toBe(1);
+    expect(await rowsForSource(source.id)).toMatchObject([{ status: "blocked" }]);
+    expect(await claimPending(testEnv.DB, Math.floor(Date.now() / 1000), "unsafe-claim-test")).toBeNull();
+  });
+
+  it("holds_the_sitemap_cursor_when_an_unsafe_terminal_record_cannot_fit", async () => {
+    const discovery = await loadDiscovery();
+    if (!discovery) return;
+    const source = await makeSource("sitemap");
+
+    const result = await discovery.discoverSource(testEnv.DB, source,
+      "<urlset><url><loc>http://127.0.0.1/private</loc></url><url><loc>https://example.com/after</loc></url></urlset>",
+      "application/xml",
+      { maxSerializedBytes: 1 },
+    );
+
+    expect(result.blocked).toBe(0);
+    expect(result.hasMore).toBe(true);
+    expect(result.stopReason).toBe("metadata_limit");
+    expect(result.lastAccountedCursor).toBeNull();
+    expect(await rowsForSource(source.id)).toHaveLength(0);
+    expect(await getSource(testEnv.DB, source.id)).toMatchObject({ sitemap_last_loc: null });
+  });
+
+  it("does_not_reset_a_feed_cursor_when_the_physical_storage_gate_is_closed", async () => {
+    const discovery = await loadDiscovery();
+    if (!discovery) return;
+    const source = await makeSource();
+    await testEnv.DB.prepare("UPDATE sources SET feed_watermark = 'story-0' WHERE id = ?").bind(source.id).run();
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = ?, storage_state = 'storage_limit' WHERE singleton_id = 'global'")
+      .bind(280 * 1024 * 1024)
+      .run();
+
+    const result = await discovery.discoverSource(testEnv.DB, { ...source, feed_watermark: "story-0" }, rss([
+      { id: "story-0", url: "https://example.com/story-0" },
+    ]), "application/rss+xml");
+
+    expect(result.cursorReset).toBe(false);
+    expect(result.hasMore).toBe(true);
+    expect(result.stopReason).toBe("storage_limit");
+    expect(await getSource(testEnv.DB, source.id)).toMatchObject({ feed_watermark: "story-0" });
+  });
+
   it("drains_a_205_item_feed_across_ten_item_storage_runs_without_skipping", async () => {
     const discovery = await loadDiscovery();
     if (!discovery) return;

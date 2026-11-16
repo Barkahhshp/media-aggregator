@@ -56,6 +56,12 @@ interface TestBindings {
   TEST_MIGRATIONS: D1Migration[];
 }
 
+interface StorageStateRow {
+  observed_db_size: number;
+  reserved_db_bytes: number;
+  storage_state: "normal" | "storage_limit" | "read_only";
+}
+
 const testEnv = env as unknown as TestBindings;
 const repositoryModules = import.meta.glob<PendingRepositoryModule>("../src/ingest/pending-repository.ts");
 
@@ -127,6 +133,85 @@ async function feedWatermark(sourceId: string): Promise<string | null> {
 async function sourceLastStatus(sourceId: string): Promise<string | null> {
   const row = await testEnv.DB.prepare("SELECT last_status FROM sources WHERE id = ?").bind(sourceId).first<{ last_status: string | null }>();
   return row?.last_status ?? null;
+}
+
+async function storageState(): Promise<StorageStateRow> {
+  const row = await testEnv.DB.prepare("SELECT observed_db_size, reserved_db_bytes, storage_state FROM system_state WHERE singleton_id = 'global'")
+    .first<StorageStateRow>();
+  if (!row) throw new Error("Expected global storage state to exist");
+  return row;
+}
+
+function countedDatabase(db: D1Database): { db: D1Database; batchCalls: () => number } {
+  let batchCalls = 0;
+  const wrapped = new Proxy(db, {
+    get(target, property) {
+      if (property === "batch") {
+        return (statements: D1PreparedStatement[]) => {
+          batchCalls += 1;
+          return target.batch(statements);
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as D1Database;
+  return { db: wrapped, batchCalls: () => batchCalls };
+}
+
+function withMeasuredSize(db: D1Database, measuredSize: number): D1Database {
+  const wrapped = new Proxy(db, {
+    get(target, property) {
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          const results = await target.batch(statements);
+          return results.map((result) => ({ ...result, meta: { ...result.meta, size_after: measuredSize } }));
+        };
+      }
+      if (property === "prepare") {
+        return (query: string) => {
+          const statement = target.prepare(query);
+          return new Proxy(statement, {
+            get(statementTarget, statementProperty) {
+              const value = Reflect.get(statementTarget, statementProperty, statementTarget) as unknown;
+              if (statementProperty === "run" && typeof value === "function") {
+                return async <T = unknown>(): Promise<D1Result<T>> => {
+                  const result = await statementTarget.run<T>();
+                  if (query.includes("write_gate_probe")) {
+                    return { ...result, meta: { ...result.meta, size_after: measuredSize } } as D1Result<T>;
+                  }
+                  return result;
+                };
+              }
+              return typeof value === "function" ? value.bind(statementTarget) : value;
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as D1Database;
+  return wrapped;
+}
+
+function withPendingBatchSize(db: D1Database, measuredSize: number): D1Database {
+  let batchNumber = 0;
+  const wrapped = new Proxy(db, {
+    get(target, property) {
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          batchNumber += 1;
+          const results = await target.batch(statements);
+          if (batchNumber !== 2) return results;
+          return results.map((result) => ({ ...result, meta: { ...result.meta, size_after: measuredSize } }));
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as D1Database;
+  return wrapped;
 }
 
 beforeEach(async () => {
@@ -211,6 +296,129 @@ describe("durable pending repository", () => {
     expect(result.lastAccountedCursor).toEqual({ kind: "feed", value: "story-1" });
     expect(await feedWatermark(source.id)).toBe("story-1");
     expect((await pendingRows()).map((row) => row.dedupe_key).sort()).toEqual(["story-0", "story-1"]);
+  });
+
+  it("bounds_D1_queries_to_50_when_duplicate_candidates_are_accounted_and_resumes_safely", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+    await testEnv.DB.prepare(`
+      WITH RECURSIVE items(value) AS (
+        SELECT 0 UNION ALL SELECT value + 1 FROM items WHERE value < 59
+      )
+      INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, status)
+      SELECT 'existing-' || value, ?, 'article', 'story-' || value,
+             'https://example.com/story-' || value, 'pending'
+      FROM items
+    `).bind(source.id).run();
+    const candidates = Array.from({ length: 60 }, (_, index) => makeCandidate(index));
+    const firstCount = countedDatabase(testEnv.DB);
+
+    const first = await repository.enqueueCandidates(firstCount.db, source, candidates, {});
+
+    expect(firstCount.batchCalls()).toBeLessThanOrEqual(50);
+    expect(first.deduplicated).toBe(25);
+    expect(first.hasMore).toBe(true);
+    expect(first.stopReason).toBe("query_limit");
+    expect(first.lastAccountedCursor).toEqual({ kind: "feed", value: "story-24" });
+    expect(await feedWatermark(source.id)).toBe("story-24");
+
+    const secondCount = countedDatabase(testEnv.DB);
+    const second = await repository.enqueueCandidates(secondCount.db, {
+      ...source,
+      feed_watermark: "story-24",
+    }, candidates.slice(25), {});
+    const third = await repository.enqueueCandidates(testEnv.DB, {
+      ...source,
+      feed_watermark: "story-49",
+    }, candidates.slice(50), {});
+
+    expect(secondCount.batchCalls()).toBeLessThanOrEqual(50);
+    expect(second.deduplicated).toBe(25);
+    expect(second.hasMore).toBe(true);
+    expect(second.lastAccountedCursor).toEqual({ kind: "feed", value: "story-49" });
+    expect(third.deduplicated).toBe(10);
+    expect(third.hasMore).toBe(false);
+    expect(await feedWatermark(source.id)).toBe("story-59");
+  });
+
+  it("records_the_physical_size_observation_after_indexed_pending_writes", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+
+    const result = await repository.enqueueCandidates(testEnv.DB, source, [makeCandidate(88)], {});
+    const state = await storageState();
+    const measured = await testEnv.DB.prepare("SELECT 1 AS physical_size_probe").run();
+
+    expect(result.inserted).toBe(1);
+    expect(state.observed_db_size).toBeGreaterThanOrEqual(measured.meta.size_after);
+    expect(state.reserved_db_bytes).toBe(0);
+    expect(state.storage_state).toBe("normal");
+  });
+
+  it("marks_storage_limit_when_a_pending_batch_reports_280_MiB_in_meta_size_after", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+
+    const result = await repository.enqueueCandidates(withPendingBatchSize(testEnv.DB, 280 * 1024 * 1024), source, [makeCandidate(0), makeCandidate(1)], {});
+
+    expect(result.inserted).toBe(1);
+    expect(result.stopReason).toBe("storage_limit");
+    expect(result.hasMore).toBe(true);
+    expect(result.lastAccountedCursor).toEqual({ kind: "feed", value: "story-0" });
+    expect((await pendingRows()).map((row) => row.dedupe_key)).toEqual(["story-0"]);
+    expect(await feedWatermark(source.id)).toBe("story-0");
+    expect(await storageState()).toMatchObject({ observed_db_size: 280 * 1024 * 1024, storage_state: "storage_limit" });
+  });
+
+  it("stops_before_pending_or_cursor_writes_when_measured_size_reaches_280_MiB", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+
+    const result = await repository.enqueueCandidates(withMeasuredSize(testEnv.DB, 280 * 1024 * 1024), source, [makeCandidate(0)], {});
+
+    expect(result.inserted).toBe(0);
+    expect(result.stopReason).toBe("storage_limit");
+    expect(result.hasMore).toBe(true);
+    expect(result.lastAccountedCursor).toBeNull();
+    expect(await pendingRows()).toHaveLength(0);
+    expect(await feedWatermark(source.id)).toBeNull();
+    expect(await storageState()).toMatchObject({ observed_db_size: 280 * 1024 * 1024, reserved_db_bytes: 0, storage_state: "storage_limit" });
+  });
+
+  it("reserves_estimated_growth_before_writing_near_the_280_MiB_stop", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+    const candidates = Array.from({ length: 35 }, (_, index) => makeCandidate(index));
+
+    const justBelowStop = 280 * 1024 * 1024 - 1;
+    const result = await repository.enqueueCandidates(withMeasuredSize(testEnv.DB, justBelowStop), source, candidates, {});
+
+    expect(result.inserted).toBe(0);
+    expect(result.stopReason).toBe("storage_limit");
+    expect(result.lastAccountedCursor).toBeNull();
+    expect(await pendingRows()).toHaveLength(0);
+    expect(await feedWatermark(source.id)).toBeNull();
+    expect(await storageState()).toMatchObject({ observed_db_size: justBelowStop, reserved_db_bytes: 0, storage_state: "storage_limit" });
+  });
+
+  it("enters_read_only_without_pending_or_cursor_writes_at_the_300_MiB_hard_cap", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+
+    const result = await repository.enqueueCandidates(withMeasuredSize(testEnv.DB, 300 * 1024 * 1024), source, [makeCandidate(0)], {});
+
+    expect(result.inserted).toBe(0);
+    expect(result.stopReason).toBe("storage_limit");
+    expect(result.lastAccountedCursor).toBeNull();
+    expect(await pendingRows()).toHaveLength(0);
+    expect(await feedWatermark(source.id)).toBeNull();
+    expect(await storageState()).toMatchObject({ observed_db_size: 300 * 1024 * 1024, reserved_db_bytes: 0, storage_state: "read_only" });
   });
 
   it("does_not_persist_or_advance_when_a_candidate_cursor_does_not_match_its_dedupe_identity", async () => {

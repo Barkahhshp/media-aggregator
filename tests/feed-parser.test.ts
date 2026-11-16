@@ -10,6 +10,7 @@ interface Candidate {
   author: string | null;
   publishedAt: string | null;
   sourceCursor: SourceCursor | null;
+  terminalFailure?: { status: "blocked" | "failed"; code: string; message: string };
 }
 
 interface SourceCursor {
@@ -22,6 +23,7 @@ interface ParsedFeed {
   hasMore: boolean;
   cursorFound: boolean;
   nextCursor: SourceCursor | null;
+  rejectedCount: number;
 }
 
 interface FeedParserModule {
@@ -42,6 +44,47 @@ async function loadFeedParser() {
 }
 
 describe("feed parsing", () => {
+  it("returns_unsafe_URLs_as_bounded_terminal_candidates_without_the_raw_URL", async () => {
+    const module = await loadFeedParser();
+    if (!module) return;
+
+    const unsafeUrl = "http://127.0.0.1/private?token=do-not-store";
+    const result = module.parseFeed(`<rss><channel><item><guid>local-story</guid><link>${unsafeUrl}</link><title>Local story</title></item><item><guid>safe</guid><link>https://example.com/safe</link></item></channel></rss>`, "application/rss+xml");
+    const rejected = result.candidates[0];
+
+    expect(result.rejectedCount).toBe(1);
+    expect(result.candidates).toHaveLength(2);
+    expect(rejected).toMatchObject({
+      terminalFailure: { status: "blocked", code: "blocked_unsafe_url" },
+      canonicalUrl: expect.stringMatching(/^https:\/\/metadata\.invalid\/sha256\/[a-f0-9]{64}$/),
+      externalId: null,
+      title: null,
+      summary: null,
+    });
+    expect(rejected?.sourceCursor?.value.length).toBeLessThanOrEqual(4096);
+    expect(JSON.stringify(rejected)).not.toContain(unsafeUrl);
+    expect(result.nextCursor).toEqual(result.candidates[1]?.sourceCursor);
+  });
+
+  it("separates_a_safe_external_ID_that_matches_the_unsafe_hash_namespace", async () => {
+    const module = await loadFeedParser();
+    if (!module) return;
+
+    const unsafeUrl = "http://127.0.0.1/private";
+    const unsafeOnly = module.parseFeed(`<rss><channel><item><guid isPermaLink="false">local-story</guid><link>${unsafeUrl}</link></item></channel></rss>`, "application/rss+xml");
+    const unsafeIdentity = unsafeOnly.candidates[0]?.dedupeKey;
+    expect(unsafeIdentity).toBeDefined();
+
+    const body = `<rss><channel><item><guid isPermaLink="false">local-story</guid><link>${unsafeUrl}</link></item><item><guid isPermaLink="false">${unsafeIdentity}</guid><link>https://example.com/safe</link></item></channel></rss>`;
+    const result = module.parseFeed(body, "application/rss+xml");
+
+    expect(result.candidates).toHaveLength(2);
+    expect(result.candidates[0]?.terminalFailure?.code).toBe("blocked_unsafe_url");
+    expect(result.candidates[1]?.terminalFailure).toBeUndefined();
+    expect(result.candidates[1]?.dedupeKey).not.toBe(unsafeIdentity);
+    expect(result.candidates[1]?.sourceCursor?.value).not.toBe(result.candidates[0]?.sourceCursor?.value);
+  });
+
   it("parses_RSS_items_into_canonical_provisional_candidates", async () => {
     const module = await loadFeedParser();
     if (!module) return;
