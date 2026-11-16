@@ -142,4 +142,40 @@ describe("source management API", () => {
     expect(response.status).toBe(413);
     expect(await response.json()).toMatchObject({ error: { code: "request_too_large" } });
   });
+
+  it.each([
+    { operation: "listSources", method: "GET", path: "/v1/sources" },
+    { operation: "getSource", method: "PATCH", path: "/v1/sources/test-source", body: { poll_interval_sec: 900 } },
+    { operation: "disableSource", method: "DELETE", path: "/v1/sources/test-source" },
+  ])("returns_a_generic_JSON_500_for_$operation", async ({ method, path, body }) => {
+    const app = await loadApp();
+    if (!app) return;
+
+    const sensitiveD1Error = "D1 internal details: account-secret-987 and SQL trace";
+    const statement: Record<string, unknown> = {};
+    statement.bind = () => statement;
+    statement.all = async () => { throw new Error(sensitiveD1Error); };
+    statement.first = async () => { throw new Error(sensitiveD1Error); };
+    const failingDb = {
+      prepare: () => statement,
+    } as unknown as D1Database;
+    const failureEnv = { ...testEnv, DB: failingDb };
+    const headers = new Headers({ Authorization: `Bearer ${testEnv.API_TOKEN}` });
+    if (body !== undefined) headers.set("Content-Type", "application/json");
+
+    const response = await app.request(
+      path,
+      { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) },
+      failureEnv,
+    );
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get("Content-Type")).toContain("application/json");
+    const payload = await response.json<{ error: { code: string; message: string; request_id: string } }>();
+    expect(payload).toMatchObject({
+      error: { code: "internal_error", message: "Internal server error" },
+    });
+    expect(payload.error.request_id).toBeTypeOf("string");
+    expect(JSON.stringify(payload)).not.toContain(sensitiveD1Error);
+  });
 });

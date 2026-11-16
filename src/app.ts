@@ -13,5 +13,17 @@ export function createApp(): Hono<{ Bindings: Env }> {
   });
   app.route("/", health);
   app.route("/", sources);
+  app.onError((_error, context) => {
+    return context.json(
+      {
+        error: {
+          code: "internal_error",
+          message: "Internal server error",
+          request_id: context.req.header("X-Request-Id") ?? crypto.randomUUID(),
+        },
+      },
+      500,
+    );
+  });
   return app;
 }
