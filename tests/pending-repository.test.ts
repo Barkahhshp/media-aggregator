@@ -6,7 +6,9 @@ import type { Candidate, SourceCursor } from "../src/ingest/types";
 import type { Source } from "../src/sources/types";
 
 interface PendingBudget {
+  now?: number;
   maxCandidates?: number;
+  maxChecks?: number;
   maxTotalRows?: number;
   maxSerializedBytes?: number;
 }
@@ -77,12 +79,12 @@ async function loadRepository() {
   return module;
 }
 
-async function makeSource(): Promise<Source> {
+async function makeSource(kind: Source["kind"] = "feed"): Promise<Source> {
   const now = Math.floor(Date.now() / 1000);
   const source: Source = {
     id: crypto.randomUUID(),
-    kind: "feed",
-    url: "https://example.com/rss.xml",
+    kind,
+    url: `https://example.com/${kind === "feed" ? "rss.xml" : "article"}`,
     host: "example.com",
     poll_interval_sec: 7200,
     selectors: null,
@@ -214,6 +216,46 @@ function withPendingBatchSize(db: D1Database, measuredSize: number): D1Database 
   return wrapped;
 }
 
+function withProgressivePendingSize(db: D1Database, initialSize: number, growthPerInsert: number): { db: D1Database; measuredSize(): number } {
+  let batchNumber = 0;
+  let inserts = 0;
+  const wrapped = new Proxy(db, {
+    get(target, property) {
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          batchNumber += 1;
+          const results = await target.batch(statements);
+          if (batchNumber >= 2 && batchNumber <= 11) inserts += 1;
+          const size = initialSize + inserts * growthPerInsert;
+          return results.map((result) => ({ ...result, meta: { ...result.meta, size_after: size } }));
+        };
+      }
+      if (property === "prepare") {
+        return (query: string) => {
+          const statement = target.prepare(query);
+          return new Proxy(statement, {
+            get(statementTarget, statementProperty) {
+              const value = Reflect.get(statementTarget, statementProperty, statementTarget) as unknown;
+              if (statementProperty === "run" && typeof value === "function") {
+                return async <T = unknown>(): Promise<D1Result<T>> => {
+                  const result = await statementTarget.run<T>();
+                  return query.includes("write_gate_probe")
+                    ? { ...result, meta: { ...result.meta, size_after: initialSize + inserts * growthPerInsert } } as D1Result<T>
+                    : result;
+                };
+              }
+              return typeof value === "function" ? value.bind(statementTarget) : value;
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as D1Database;
+  return { db: wrapped, measuredSize: () => initialSize + inserts * growthPerInsert };
+}
+
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);
@@ -233,6 +275,30 @@ describe("durable pending repository", () => {
     expect(await feedWatermark(source.id)).toBe("story-9");
     expect(await pendingRows()).toHaveLength(10);
     expect((await pendingRows()).every((row) => row.source_id === source.id)).toBe(true);
+  });
+
+  it("deduplicates_and_queues_direct_article_candidates_without_a_feed_cursor", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource("article");
+    const direct = makeCandidate(0, {
+      externalId: null,
+      dedupeKey: source.url,
+      canonicalUrl: source.url,
+      sourceCursor: null,
+    });
+
+    const first = await repository.enqueueCandidates(testEnv.DB, source, [direct], {});
+    const second = await repository.enqueueCandidates(testEnv.DB, source, [direct], {});
+
+    expect(first.inserted).toBe(1);
+    expect(first.stopReason).toBeNull();
+    expect(first.lastAccountedCursor).toBeNull();
+    expect(second.inserted).toBe(0);
+    expect(second.deduplicated).toBe(1);
+    expect(second.stopReason).toBeNull();
+    expect(await pendingRows()).toHaveLength(1);
+    expect(await feedWatermark(source.id)).toBeNull();
   });
 
   it("advances_over_an_existing_dedupe_even_when_new_rows_cannot_fit", async () => {
@@ -406,6 +472,40 @@ describe("durable pending repository", () => {
     expect(await storageState()).toMatchObject({ observed_db_size: justBelowStop, reserved_db_bytes: 0, storage_state: "storage_limit" });
   });
 
+  it("stops_sustained_overload_below_300_MiB_without_advancing_past_an_unpersisted_cursor", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+    const candidates = Array.from({ length: 20 }, (_, index) => makeCandidate(index));
+    const initialSize = 270 * 1024 * 1024;
+    const growthPerInsert = 1024 * 1024;
+    const firstRunDb = withProgressivePendingSize(testEnv.DB, initialSize, growthPerInsert);
+
+    const first = await repository.enqueueCandidates(firstRunDb.db, source, candidates.slice(0, 10), {
+      maxCandidates: 10,
+      maxChecks: 10,
+    });
+    const watermarkAfterFirst = await feedWatermark(source.id);
+    const second = await repository.enqueueCandidates(withMeasuredSize(testEnv.DB, 280 * 1024 * 1024), source, candidates.slice(10), {
+      maxCandidates: 10,
+      maxChecks: 10,
+    });
+    const state = await storageState();
+
+    expect(first.inserted).toBe(10);
+    expect(first.stopReason).toBe("storage_limit");
+    expect(first.lastAccountedCursor).toEqual({ kind: "feed", value: "story-9" });
+    expect(watermarkAfterFirst).toBe("story-9");
+    expect(second.inserted).toBe(0);
+    expect(second.stopReason).toBe("storage_limit");
+    expect(second.lastAccountedCursor).toBeNull();
+    expect(await feedWatermark(source.id)).toBe("story-9");
+    expect((await pendingRows()).map((row) => row.dedupe_key).sort()).toEqual(candidates.slice(0, 10).map((item) => item.dedupeKey).sort());
+    expect(state.observed_db_size).toBe(280 * 1024 * 1024);
+    expect(state.observed_db_size).toBeLessThan(300 * 1024 * 1024);
+    expect(state.reserved_db_bytes).toBe(0);
+  });
+
   it("enters_read_only_without_pending_or_cursor_writes_at_the_300_MiB_hard_cap", async () => {
     const repository = await loadRepository();
     if (!repository) return;
@@ -537,6 +637,21 @@ describe("durable pending repository", () => {
     expect(reclaimed).toMatchObject({ status: "leased", lease_token: "lease-reclaim" });
   });
 
+  it("does_not_claim_pending_items_when_the_storage_write_gate_is_closed", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+    await repository.enqueueCandidates(testEnv.DB, source, [makeCandidate(0)], {});
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = ?, storage_state = 'storage_limit' WHERE singleton_id = 'global'")
+      .bind(280 * 1024 * 1024).run();
+
+    const claimed = await repository.claimPending(testEnv.DB, Math.floor(Date.now() / 1000) + 10, "denied-lease");
+
+    expect(claimed).toBeNull();
+    expect(await pendingRows()).toMatchObject([{ status: "pending", lease_token: null, attempts: 0 }]);
+    expect(await storageState()).toMatchObject({ storage_state: "storage_limit", reserved_db_bytes: 0 });
+  });
+
   it("keeps_retryable_failures_and_releases_them_at_the_requested_time", async () => {
     const repository = await loadRepository();
     if (!repository) return;
@@ -557,6 +672,26 @@ describe("durable pending repository", () => {
     expect(saved).toMatchObject({ status: "retry_wait", attempts: 1, next_attempt_at: now + 300, lease_token: null, lease_expires_at: null });
     expect(await repository.claimPending(testEnv.DB, now + 299, "too-early")).toBeNull();
     expect((await repository.claimPending(testEnv.DB, now + 300, "due-again"))?.dedupe_key).toBe("story-0");
+  });
+
+  it("does_not_record_pending_failures_when_the_storage_write_gate_is_closed", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource();
+    await repository.enqueueCandidates(testEnv.DB, source, [makeCandidate(0)], {});
+    const now = Math.floor(Date.now() / 1000);
+    await testEnv.DB.prepare("UPDATE pending_items SET status = 'leased', lease_token = 'active-lease', lease_expires_at = ? WHERE source_id = ?")
+      .bind(now + 120, source.id).run();
+    const item = (await pendingRows())[0];
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = ?, storage_state = 'storage_limit' WHERE singleton_id = 'global'")
+      .bind(280 * 1024 * 1024).run();
+
+    await expect(repository.markPendingFailure(testEnv.DB, item, {
+      kind: "retryable", nextAttemptAt: now + 300, code: "temporary_fetch_error", message: "retry later",
+    })).rejects.toThrow(/storage_limit/);
+
+    expect(await pendingRows()).toMatchObject([{ status: "leased", lease_token: "active-lease", attempts: 0 }]);
+    expect(await storageState()).toMatchObject({ storage_state: "storage_limit", reserved_db_bytes: 0 });
   });
 
   it("retains_terminal_failures_for_thirty_days_then_purges_them", async () => {

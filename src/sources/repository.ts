@@ -68,6 +68,10 @@ export async function createSource(db: D1Database, input: SourceInput): Promise<
       `INSERT INTO sources (id, url, kind, host, poll_interval_sec, selectors_json)
        SELECT ?, ?, ?, ?, ?, ?
        WHERE (SELECT COUNT(*) FROM sources WHERE enabled = 1) < ?
+         AND NOT EXISTS (
+           SELECT 1 FROM system_state
+           WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_expires_at > unixepoch()
+         )
        RETURNING *`,
     )
     .bind(
@@ -82,6 +86,11 @@ export async function createSource(db: D1Database, input: SourceInput): Promise<
     .first<SourceRow>();
 
   if (row === null) {
+    const lock = await db.prepare("SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'")
+      .first<{ export_lock: number; export_lock_expires_at: number | null }>();
+    if (lock?.export_lock === 1 && (lock.export_lock_expires_at ?? 0) > Math.floor(Date.now() / 1000)) {
+      throw new SourceRepositoryError(423, "export_in_progress", "Source changes are paused during export");
+    }
     throw new SourceRepositoryError(409, "source_limit_reached", "Maximum of 100 active sources reached");
   }
   return toSource(row);
@@ -97,6 +106,7 @@ export async function updateSource(
   id: string,
   input: SourceInput,
   enabled?: boolean,
+  allowDuringExport = false,
 ): Promise<Source | null> {
   const url = new URL(input.url);
   const nextEnabled = enabled === undefined ? null : Number(enabled);
@@ -106,6 +116,10 @@ export async function updateSource(
        SET url = ?, kind = ?, host = ?, poll_interval_sec = ?, selectors_json = ?, enabled = COALESCE(?, enabled), updated_at = unixepoch()
        WHERE id = ?
          AND (COALESCE(?, enabled) = 0 OR enabled = 1 OR (SELECT COUNT(*) FROM sources WHERE enabled = 1) < ?)
+         AND (? = 1 OR NOT EXISTS (
+           SELECT 1 FROM system_state
+           WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_expires_at > unixepoch()
+         ))
        RETURNING *`,
     )
     .bind(
@@ -118,10 +132,18 @@ export async function updateSource(
       id,
       nextEnabled,
       MAX_ACTIVE_SOURCES,
+      Number(allowDuringExport),
     )
     .first<SourceRow>();
 
   if (row !== null) return toSource(row);
+  if (!allowDuringExport) {
+    const lock = await db.prepare("SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'")
+      .first<{ export_lock: number; export_lock_expires_at: number | null }>();
+    if (lock?.export_lock === 1 && (lock.export_lock_expires_at ?? 0) > Math.floor(Date.now() / 1000)) {
+      throw new SourceRepositoryError(423, "export_in_progress", "Source changes are paused during export");
+    }
+  }
   const existing = await getSource(db, id);
   if (existing === null) return null;
   throw new SourceRepositoryError(409, "source_limit_reached", "Maximum of 100 active sources reached");

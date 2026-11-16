@@ -1,5 +1,6 @@
 import { createApp } from "./app";
 import type { Env } from "./env";
+import { runScheduled } from "./ingest/scheduler";
 
 const app = createApp();
 
@@ -8,10 +9,10 @@ export default {
     return app.fetch(request, env, context);
   },
   scheduled(
-    _event: ScheduledController,
-    _env: Env,
-    _context: ExecutionContext,
+    event: ScheduledController,
+    env: Env,
+    context: ExecutionContext,
   ): void {
-    // Scheduled ingestion is added in Task 5.
+    context.waitUntil(runScheduled(env, event.scheduledTime));
   },
 } satisfies ExportedHandler<Env>;

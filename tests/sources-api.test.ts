@@ -2,6 +2,7 @@ import { applyD1Migrations, reset } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
+import { createSource } from "../src/sources/repository";
 
 interface TestEnvironment {
   DB: D1Database;
@@ -110,6 +111,105 @@ describe("source management API", () => {
     expect(response.status).toBe(200);
     const updated = await response.json<{ source: Record<string, unknown> }>();
     expect(updated.source).toMatchObject({ enabled: false, poll_interval_sec: 900 });
+  });
+
+  it("rejects_new_sources_when_physical_storage_is_limited", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = ?, storage_state = 'storage_limit' WHERE singleton_id = 'global'")
+      .bind(280 * 1024 * 1024).run();
+
+    const response = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed", url: "https://example.com/storage-limited-feed",
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "storage_limit" } });
+    expect(await testEnv.DB.prepare("SELECT id FROM sources WHERE url = 'https://example.com/storage-limited-feed'").first()).toBeNull();
+  });
+
+  it("rejects_new_sources_while_an_export_lock_is_active", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    await testEnv.DB.prepare("UPDATE system_state SET export_lock = 1, export_lock_id = 'export-1', export_lock_expires_at = ? WHERE singleton_id = 'global'")
+      .bind(Math.floor(Date.now() / 1000) + 600).run();
+
+    const response = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed", url: "https://example.com/export-locked-feed",
+    });
+
+    expect(response.status).toBe(423);
+    expect(await response.json()).toMatchObject({ error: { code: "export_in_progress" } });
+    expect(await testEnv.DB.prepare("SELECT id FROM sources WHERE url = 'https://example.com/export-locked-feed'").first()).toBeNull();
+  });
+
+  it("prevents_a_source_insert_if_an_export_lock_starts_after_the_route_check", async () => {
+    await testEnv.DB.prepare("UPDATE system_state SET export_lock = 1, export_lock_id = 'export-race', export_lock_expires_at = ? WHERE singleton_id = 'global'")
+      .bind(Math.floor(Date.now() / 1000) + 600).run();
+
+    await expect(createSource(testEnv.DB, {
+      kind: "feed",
+      url: "https://example.com/export-race-feed",
+      poll_interval_sec: 7200,
+    })).rejects.toMatchObject({ status: 423, code: "export_in_progress" });
+    expect(await testEnv.DB.prepare("SELECT id FROM sources WHERE url = 'https://example.com/export-race-feed'").first()).toBeNull();
+  });
+
+  it("blocks_source_configuration_edits_but_allows_disable_and_delete_during_export", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const created = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed", url: "https://example.com/export-update-feed",
+    });
+    const source = await created.json<{ source: { id: string } }>();
+    await testEnv.DB.prepare("UPDATE system_state SET export_lock = 1, export_lock_id = 'export-1', export_lock_expires_at = ? WHERE singleton_id = 'global'")
+      .bind(Math.floor(Date.now() / 1000) + 600).run();
+
+    const patched = await sourceRequest(app, `/v1/sources/${source.source.id}`, "PATCH", { poll_interval_sec: 900 });
+    const disabledPatch = await sourceRequest(app, `/v1/sources/${source.source.id}`, "PATCH", { enabled: false });
+    const disabled = await sourceRequest(app, `/v1/sources/${source.source.id}`, "DELETE");
+
+    expect(patched.status).toBe(423);
+    expect(disabledPatch.status).toBe(200);
+    expect(disabled.status).toBe(200);
+    expect(await testEnv.DB.prepare("SELECT enabled, poll_interval_sec FROM sources WHERE id = ?").bind(source.source.id).first())
+      .toMatchObject({ enabled: 0, poll_interval_sec: 7200 });
+  });
+
+  it("allows_source_disable_while_physical_storage_is_limited", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const created = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed", url: "https://example.com/storage-disable-feed",
+    });
+    const source = await created.json<{ source: { id: string } }>();
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = ?, storage_state = 'read_only' WHERE singleton_id = 'global'")
+      .bind(300 * 1024 * 1024).run();
+
+    const disabled = await sourceRequest(app, `/v1/sources/${source.source.id}`, "DELETE");
+
+    expect(disabled.status).toBe(200);
+    expect(await testEnv.DB.prepare("SELECT enabled FROM sources WHERE id = ?").bind(source.source.id).first())
+      .toMatchObject({ enabled: 0 });
+  });
+
+  it("allows_patch_disable_but_not_other_source_edits_in_read_only_storage_state", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const created = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed", url: "https://example.com/read-only-feed",
+    });
+    const source = await created.json<{ source: { id: string } }>();
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = ?, storage_state = 'read_only' WHERE singleton_id = 'global'")
+      .bind(300 * 1024 * 1024).run();
+
+    const changedInterval = await sourceRequest(app, `/v1/sources/${source.source.id}`, "PATCH", { poll_interval_sec: 900 });
+    const disabled = await sourceRequest(app, `/v1/sources/${source.source.id}`, "PATCH", { enabled: false });
+
+    expect(changedInterval.status).toBe(503);
+    expect(disabled.status).toBe(200);
+    expect(await testEnv.DB.prepare("SELECT enabled, poll_interval_sec FROM sources WHERE id = ?").bind(source.source.id).first())
+      .toMatchObject({ enabled: 0, poll_interval_sec: 7200 });
   });
 
   it("caps_active_sources_at_100", async () => {

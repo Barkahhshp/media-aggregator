@@ -54,15 +54,20 @@ export async function fetchPublicUrl(
   }
 
   let currentUrl = normalizeAndValidateUrl(url.href, sourceHost);
+  const requestHeaders = new Headers({
+    Accept: "application/rss+xml, application/atom+xml, application/feed+json, application/json, application/xml, text/xml, text/html;q=0.9, */*;q=0.1",
+  });
+  new Headers(limits.headers).forEach((value, name) => requestHeaders.set(name, value));
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     for (let redirectCount = 0; ; redirectCount += 1) {
+      limits.onRequest?.();
       const response = await fetch(currentUrl, {
         method: "GET",
         redirect: "manual",
         signal: controller.signal,
-        headers: { Accept: "application/rss+xml, application/atom+xml, application/feed+json, application/json, application/xml, text/xml, text/html;q=0.9, */*;q=0.1" },
+        headers: requestHeaders,
       });
 
       if (REDIRECT_STATUSES.has(response.status)) {

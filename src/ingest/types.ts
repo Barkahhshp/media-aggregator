@@ -20,6 +20,8 @@ export interface FetchLimits {
   maxRedirects?: number;
   timeoutMs?: number;
   maxBytes?: number;
+  headers?: HeadersInit;
+  onRequest?: () => void;
 }
 
 export interface FetchResult {

@@ -4,6 +4,7 @@ interface FetchLimits {
   maxRedirects?: number;
   timeoutMs?: number;
   maxBytes?: number;
+  headers?: HeadersInit;
 }
 
 interface FetchResult {
@@ -54,6 +55,25 @@ describe("safe HTTP fetch", () => {
     expect(result.url.href).toBe("https://example.com/final");
     expect(calls).toHaveLength(4);
     expect(calls.every((call) => call.init?.redirect === "manual")).toBe(true);
+  });
+
+  it("forwards_conditional_source_headers_to_the_safe_HTTP_request", async () => {
+    const fetchPublicUrl = await loadFetchPublicUrl();
+    if (!fetchPublicUrl) return;
+    let requestHeaders: Headers | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestHeaders = new Headers(init?.headers);
+      return new Response(null, { status: 304 });
+    }));
+
+    const result = await fetchPublicUrl(new URL("https://example.com/feed"), "example.com", {
+      headers: { "If-None-Match": '"feed-v2"', "If-Modified-Since": "Sun, 16 Nov 2026 10:00:00 GMT" },
+    });
+
+    expect(result.status).toBe(304);
+    expect(requestHeaders?.get("If-None-Match")).toBe('"feed-v2"');
+    expect(requestHeaders?.get("If-Modified-Since")).toBe("Sun, 16 Nov 2026 10:00:00 GMT");
+    expect(requestHeaders?.get("Accept")).toContain("application/rss+xml");
   });
 
   it("rejects_a_cross_host_redirect_before_fetching_the_target", async () => {

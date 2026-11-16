@@ -25,8 +25,12 @@ const PENDING_HASH_PREFIX = "__cue_pending_sha256_v1__:";
 const OVERFLOW_URL_PREFIX = "https://metadata.invalid/sha256/";
 
 export interface PendingBudget {
+  /** Scheduler timestamp used to make newly discovered rows immediately eligible. */
+  now?: number;
   /** Maximum number of new rows inserted by this call. Defaults to 10. */
   maxCandidates?: number;
+  /** Maximum number of candidates, including dedupe hits, checked by this call. */
+  maxChecks?: number;
   /** Total backlog row cap. Defaults to 2,000. */
   maxTotalRows?: number;
   /** Total serialized metadata byte cap. Defaults to 24 MiB. */
@@ -208,6 +212,24 @@ function cursorUpdateStatement(db: D1Database, source: Source, prepared: Prepare
   );
 }
 
+function directCandidateAccountedStatement(db: D1Database, prepared: PreparedCandidate): D1PreparedStatement {
+  return db.prepare(`
+    SELECT 1 AS accounted
+    WHERE EXISTS (SELECT 1 FROM pending_items WHERE source_id = ? AND dedupe_key = ?)
+       OR EXISTS (
+         SELECT 1 FROM articles
+         WHERE source_id = ? AND ((? IS NOT NULL AND external_id = ?) OR canonical_url = ?)
+       )
+  `).bind(
+    prepared.sourceId,
+    prepared.dedupeKey,
+    prepared.sourceId,
+    prepared.externalId,
+    prepared.externalId,
+    prepared.canonicalUrl,
+  );
+}
+
 async function pendingStats(db: D1Database): Promise<{ count: number; bytes: number }> {
   const row = await db.prepare(`
     SELECT COUNT(*) AS count,
@@ -241,7 +263,7 @@ export async function enqueueCandidates(
     hasMore: false,
     stopReason: null,
   };
-  if (source.kind !== "feed" && source.kind !== "sitemap") {
+  if (source.kind !== "feed" && source.kind !== "sitemap" && source.kind !== "article" && source.kind !== "html_list") {
     result.hasMore = candidates.length > 0;
     result.stopReason = candidates.length > 0 ? "unsupported_source" : null;
     return result;
@@ -250,8 +272,9 @@ export async function enqueueCandidates(
   const maxNewRows = Math.max(0, Math.min(MAX_PENDING_INSERTS_PER_CALL, budget.maxCandidates ?? MAX_PENDING_INSERTS_PER_CALL));
   const maxTotalRows = Math.max(0, Math.min(MAX_PENDING_ROWS, budget.maxTotalRows ?? MAX_PENDING_ROWS));
   const maxBytes = Math.max(0, Math.min(MAX_PENDING_METADATA_BYTES, budget.maxSerializedBytes ?? MAX_PENDING_METADATA_BYTES));
-  const now = Math.floor(Date.now() / 1000);
-  const candidatesToCheck = Math.min(candidates.length, MAX_PENDING_CHECKS_PER_CALL);
+  const now = budget.now ?? Math.floor(Date.now() / 1000);
+  const maxChecks = Math.max(0, Math.min(MAX_PENDING_CHECKS_PER_CALL, budget.maxChecks ?? MAX_PENDING_CHECKS_PER_CALL));
+  const candidatesToCheck = Math.min(candidates.length, maxChecks);
   if (candidatesToCheck === 0) return result;
 
   const reservation = await checkWriteGate(
@@ -270,20 +293,21 @@ export async function enqueueCandidates(
     for (let index = 0; index < candidatesToCheck; index += 1) {
       const candidate = candidates[index] as PendingCandidate;
       const prepared = prepareCandidate(source, candidate, now);
-      const cursorUpdate = cursorUpdateStatement(db, source, prepared);
+      const cursor = candidate.sourceCursor;
+      const cursorUpdate = cursor === null && (source.kind === "article" || source.kind === "html_list")
+        ? directCandidateAccountedStatement(db, prepared)
+        : cursorUpdateStatement(db, source, prepared);
       if (cursorUpdate === null) {
         result.hasMore = true;
         result.stopReason = "invalid_cursor";
         break;
       }
-
-      const cursor = candidate.sourceCursor;
       const insert = db.prepare(`
       INSERT OR IGNORE INTO pending_items (
         id, source_id, item_type, dedupe_key, external_id, canonical_url,
-        title, summary, published_at, status, last_error, terminal_expires_at
+        title, summary, published_at, status, next_attempt_at, last_error, terminal_expires_at
       )
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE (SELECT COUNT(*) FROM pending_items) < ?
         AND COALESCE((
           SELECT SUM(length(CAST(json_object(
@@ -319,6 +343,7 @@ export async function enqueueCandidates(
       prepared.summary,
       prepared.publishedAt,
       prepared.status,
+      now,
       prepared.lastError,
       prepared.terminalExpiresAt,
       maxTotalRows,
@@ -341,7 +366,7 @@ export async function enqueueCandidates(
       const batch = await db.batch([insert, cursorUpdate]);
       latestSize = batch[1]?.meta.size_after ?? batch[0]?.meta.size_after ?? latestSize;
       const inserted = (batch[0]?.results?.length ?? 0) > 0;
-      const accounted = (batch[1]?.results?.length ?? 0) > 0;
+      const accounted = inserted || (batch[1]?.results?.length ?? 0) > 0;
       if (!inserted && !accounted) {
         const stats = await pendingStats(db);
         result.hasMore = true;
@@ -388,21 +413,37 @@ export async function enqueueCandidates(
   return result;
 }
 
-export async function claimPending(db: D1Database, now: number, leaseToken: string): Promise<PendingItem | null> {
+export async function claimPending(
+  db: D1Database,
+  now: number,
+  leaseToken: string,
+  itemType?: PendingItem["item_type"],
+): Promise<PendingItem | null> {
+  const reservation = await checkWriteGate(db, "pending", 2 * 1024);
+  if (reservation === "storage_limit") return null;
   const leaseExpiresAt = now + PENDING_LEASE_SECONDS;
-  const row = await db.prepare(`
-    UPDATE pending_items
-    SET status = 'leased', lease_token = ?, lease_expires_at = ?, updated_at = ?
-    WHERE id = (
-      SELECT id FROM pending_items
-      WHERE (status IN ('pending', 'retry_wait') AND next_attempt_at <= ?)
-         OR (status = 'leased' AND lease_expires_at <= ?)
-      ORDER BY discovered_at ASC, id ASC
-      LIMIT 1
-    )
-    RETURNING *
-  `).bind(leaseToken, leaseExpiresAt, now, now, now).first<PendingItem>();
-  return row;
+  let sizeAfter = reservation.measuredSize;
+  try {
+    const result = await db.prepare(`
+      UPDATE pending_items
+      SET status = 'leased', lease_token = ?, lease_expires_at = ?, updated_at = ?
+      WHERE id = (
+        SELECT id FROM pending_items
+        WHERE (
+          (status IN ('pending', 'retry_wait') AND next_attempt_at <= ?)
+          OR (status = 'leased' AND lease_expires_at <= ?)
+        ) AND (? IS NULL OR item_type = ?)
+        ORDER BY discovered_at ASC, id ASC
+        LIMIT 1
+      )
+      RETURNING *
+    `).bind(leaseToken, leaseExpiresAt, now, now, now, itemType ?? null, itemType ?? null).run<PendingItem>();
+    sizeAfter = result.meta.size_after;
+    if (sizeAfter >= D1_STORAGE_STOP_BYTES) return null;
+    return result.results?.[0] ?? null;
+  } finally {
+    await completeWriteReservation(db, reservation.id, sizeAfter, now);
+  }
 }
 
 export async function markPendingFailure(db: D1Database, item: PendingItem, outcome: PendingFailure): Promise<void> {
@@ -412,14 +453,22 @@ export async function markPendingFailure(db: D1Database, item: PendingItem, outc
   const status = terminal ? outcome.status : "retry_wait";
   const nextAttemptAt = terminal ? now : outcome.nextAttemptAt;
   const terminalExpiresAt = terminal ? now + TERMINAL_RETENTION_SECONDS : null;
-  const result = await db.prepare(`
-    UPDATE pending_items
-    SET status = ?, attempts = attempts + 1, next_attempt_at = ?, last_error = ?,
-        terminal_expires_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
-    WHERE id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?
-    RETURNING id
-  `).bind(status, nextAttemptAt, error, terminalExpiresAt, now, item.id, item.lease_token, now).first<{ id: string }>();
-  if (result === null) throw new Error("Pending lease is no longer valid");
+  const reservation = await checkWriteGate(db, "pending", 2 * 1024);
+  if (reservation === "storage_limit") throw new Error("Pending failure write stopped by storage_limit");
+  let sizeAfter = reservation.measuredSize;
+  try {
+    const result = await db.prepare(`
+      UPDATE pending_items
+      SET status = ?, attempts = attempts + 1, next_attempt_at = ?, last_error = ?,
+          terminal_expires_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+      WHERE id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?
+      RETURNING id
+    `).bind(status, nextAttemptAt, error, terminalExpiresAt, now, item.id, item.lease_token, now).run<{ id: string }>();
+    sizeAfter = result.meta.size_after;
+    if ((result.results?.length ?? 0) === 0) throw new Error("Pending lease is no longer valid");
+  } finally {
+    await completeWriteReservation(db, reservation.id, sizeAfter, now);
+  }
 }
 
 export async function purgeExpiredTerminalItems(db: D1Database, now: number): Promise<number> {

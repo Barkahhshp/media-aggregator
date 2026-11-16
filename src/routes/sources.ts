@@ -3,6 +3,8 @@ import type { Env } from "../env";
 import { createSource, disableSource, getSource, listSources, SourceRepositoryError, updateSource } from "../sources/repository";
 import type { ApiError, SourcePatchInput } from "../sources/types";
 import { isApiError, MAX_SOURCE_REQUEST_BYTES, validateSourceInput } from "../sources/validation";
+import { checkWriteGate, completeWriteReservation } from "../ingest/storage-guard";
+import type { WriteReservation } from "../ingest/storage-guard";
 
 export const sources = new Hono<{ Bindings: Env }>();
 
@@ -99,12 +101,30 @@ sources.post("/v1/sources", async (context) => {
   const input = validateSourceInput(parsed.value);
   if (isApiError(input)) return apiErrorResponse(input, context.req.raw);
 
+  const now = Math.floor(Date.now() / 1000);
+  const exportLock = await context.env.DB.prepare(
+    "SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'",
+  ).first<{ export_lock: number; export_lock_expires_at: number | null }>();
+  if (exportLock?.export_lock === 1 && (exportLock.export_lock_expires_at ?? 0) > now) {
+    return apiErrorResponse({ status: 423, code: "export_in_progress", message: "Source changes are paused during export" }, context.req.raw);
+  }
+
+  const inputBytes = new TextEncoder().encode(JSON.stringify(input)).byteLength;
+  const reservation = await checkWriteGate(context.env.DB, "source", inputBytes + 4 * 1024, crypto.randomUUID(), now);
+  if (reservation === "storage_limit") {
+    return apiErrorResponse({ status: 503, code: "storage_limit", message: "Source additions are paused because storage is full" }, context.req.raw);
+  }
+  let measuredSize = reservation.measuredSize;
   try {
     const source = await createSource(context.env.DB, input);
+    const sizeProbe = await context.env.DB.prepare("SELECT 1 AS source_size_probe").run();
+    measuredSize = sizeProbe.meta.size_after;
     return context.json({ source }, 201);
   } catch (error) {
     if (error instanceof SourceRepositoryError) return repositoryErrorResponse(error, context.req.raw);
     throw error;
+  } finally {
+    await completeWriteReservation(context.env.DB, reservation.id, measuredSize, now);
   }
 });
 
@@ -127,15 +147,39 @@ sources.patch("/v1/sources/:id", async (context) => {
   });
   if (isApiError(candidate)) return apiErrorResponse(candidate, context.req.raw);
 
+  const now = Math.floor(Date.now() / 1000);
+  const disableOnly = update.enabled === false
+    && update.poll_interval_sec === undefined
+    && update.selectors === undefined;
+  const exportLock = await context.env.DB.prepare(
+    "SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'",
+  ).first<{ export_lock: number; export_lock_expires_at: number | null }>();
+  if (!disableOnly && exportLock?.export_lock === 1 && (exportLock.export_lock_expires_at ?? 0) > now) {
+    return apiErrorResponse({ status: 423, code: "export_in_progress", message: "Source changes are paused during export" }, context.req.raw);
+  }
+  let reservation: WriteReservation | null = null;
+  if (!disableOnly) {
+    const updateBytes = new TextEncoder().encode(JSON.stringify(candidate)).byteLength;
+    const writeGate = await checkWriteGate(context.env.DB, "source", updateBytes + 4 * 1024, crypto.randomUUID(), now);
+    if (writeGate === "storage_limit") {
+      return apiErrorResponse({ status: 503, code: "storage_limit", message: "Source updates are paused because storage is full" }, context.req.raw);
+    }
+    reservation = writeGate;
+  }
+  let measuredSize = reservation?.measuredSize ?? 0;
   try {
-    const source = await updateSource(context.env.DB, current.id, candidate, update.enabled);
+    const source = await updateSource(context.env.DB, current.id, candidate, update.enabled, disableOnly);
     if (source === null) {
       return apiErrorResponse({ status: 404, code: "source_not_found", message: "Source not found" }, context.req.raw);
     }
+    const sizeProbe = await context.env.DB.prepare("SELECT 1 AS source_size_probe").run();
+    measuredSize = sizeProbe.meta.size_after;
     return context.json({ source });
   } catch (error) {
     if (error instanceof SourceRepositoryError) return repositoryErrorResponse(error, context.req.raw);
     throw error;
+  } finally {
+    if (reservation !== null) await completeWriteReservation(context.env.DB, reservation.id, measuredSize, now);
   }
 });
 
