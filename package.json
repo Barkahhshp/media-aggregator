@@ -8,6 +8,7 @@
     "build": "wrangler deploy --dry-run --outdir dist --env \"\""
   },
   "dependencies": {
+    "@noble/hashes": "^2.4.0",
     "hono": "^4.13.18",
     "ipaddr.js": "^2.5.0",
     "sax": "^1.6.1"

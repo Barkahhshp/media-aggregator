@@ -1,4 +1,5 @@
 import { normalizeAndValidateUrl } from "./url-policy";
+import { stableCursorValue } from "./cursor";
 import { normalizePublishedAt } from "./feed-parser";
 import type { ParsedSitemap } from "./types";
 import { childrenNamed, firstChildText, localName, parseXmlDocument } from "./xml";
@@ -23,10 +24,11 @@ export function parseSitemap(body: string): ParsedSitemap {
     }
     if (seen.has(canonical)) continue;
     seen.add(canonical);
+    const sourceCursor = { kind: "sitemap" as const, value: stableCursorValue(canonical) };
     locations.push({
       url: canonical,
       lastModified: normalizePublishedAt(firstChildText(record, "lastmod")),
-      sourceCursor: { kind: "sitemap", value: canonical },
+      sourceCursor,
     });
   }
 

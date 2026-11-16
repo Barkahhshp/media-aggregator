@@ -1,3 +1,4 @@
+import { stableCursorValue } from "./cursor";
 import { normalizeAndValidateUrl } from "./url-policy";
 import type { Candidate, ParsedFeed, SourceCursor } from "./types";
 import { childrenNamed, firstChild, firstChildText, localName, nodeText, parseXmlDocument, type XmlNode } from "./xml";
@@ -43,18 +44,19 @@ export function normalizePublishedAt(value: string | null | undefined): string |
 }
 
 function candidate(
-  item: { id: string; url: string; title?: string; summary?: string; author?: string; publishedAt?: string },
+  item: { id: string | null; url: string; title?: string; summary?: string; author?: string; publishedAt?: string },
 ): Candidate | null {
-  const externalId = cleanText(item.id);
+  const externalId = item.id === null ? null : cleanText(item.id);
   let canonicalUrl: string;
   try {
     canonicalUrl = normalizeAndValidateUrl(item.url).href;
   } catch {
     return null;
   }
-  const cursor: SourceCursor = { kind: "feed", value: externalId ?? canonicalUrl };
+  const identity = externalId ?? canonicalUrl;
+  const cursor: SourceCursor = { kind: "feed", value: stableCursorValue(identity) };
   return {
-    dedupeKey: externalId ?? canonicalUrl,
+    dedupeKey: identity,
     canonicalUrl,
     externalId,
     title: cleanText(item.title ?? ""),
@@ -77,7 +79,7 @@ function rssCandidates(root: XmlNode): Candidate[] {
     const url = link || (guidNode?.attributes.isPermaLink?.toLowerCase() !== "false" ? guid : "");
     if (url.length === 0) continue;
     const parsed = candidate({
-      id: guid || url,
+      id: guid || null,
       url,
       title: firstChildText(item, "title"),
       summary: firstChildText(item, "description"),
@@ -107,7 +109,7 @@ function atomCandidates(root: XmlNode): Candidate[] {
     if (url.length === 0) continue;
     const author = firstChild(entry, "author");
     const parsed = candidate({
-      id: id || url,
+      id: id || null,
       url,
       title: firstChildText(entry, "title"),
       summary: firstChildText(entry, "summary") || firstChildText(entry, "content"),
@@ -157,7 +159,7 @@ function jsonCandidates(body: string): Candidate[] {
     const title = typeof record.title === "string" ? record.title : "";
     const summary = typeof record.summary === "string" ? record.summary : typeof record.content_text === "string" ? record.content_text : "";
     const publishedAt = typeof record.date_published === "string" ? record.date_published : typeof record.date_modified === "string" ? record.date_modified : "";
-    const parsed = candidate({ id: id || url, url, title, summary, author, publishedAt });
+    const parsed = candidate({ id: id || null, url, title, summary, author, publishedAt });
     if (parsed !== null) output.push(parsed);
   }
   return output;

@@ -199,6 +199,63 @@ describe("feed parsing", () => {
     expect(new Set(yieldedUrls).size).toBe(205);
   });
 
+  it("uses_bounded_namespaced_SHA256_cursors_for_oversized_or_reserved_ID_values", async () => {
+    const module = await loadFeedParser();
+    if (!module) return;
+    const longId = `long-${"x".repeat(5000)}`;
+    const reservedId = `__cue_cursor_sha256_v1__:${"a".repeat(64)}`;
+    const body = `<rss><channel><item><guid>${longId}</guid><link>https://example.com/long</link></item><item><guid>${reservedId}</guid><link>https://example.com/reserved</link></item></channel></rss>`;
+
+    const firstParse = module.parseFeed(body, "application/rss+xml");
+    const repeatParse = module.parseFeed(body, "application/rss+xml");
+    const longCursor = firstParse.candidates[0]?.sourceCursor?.value ?? "";
+    const reservedCursor = firstParse.candidates[1]?.sourceCursor?.value ?? "";
+
+    expect(longCursor).toBe("__cue_cursor_sha256_v1__:e18e44419b858b33e42399d9e25b5afc283e77e51a9654953273e4cf64dce80d");
+    expect(reservedCursor).toBe("__cue_cursor_sha256_v1__:df2657a194263f5c0472f50a14fb70029cd10efa62162aeb9708d51af51cc8e2");
+    expect(longCursor).not.toBe(longId);
+    expect(reservedCursor).not.toBe(reservedId);
+    expect(new TextEncoder().encode(longCursor).byteLength).toBeLessThanOrEqual(4096);
+    expect(repeatParse).toEqual(firstParse);
+  });
+
+  it("hashes_an_oversized_no_ID_canonical_URL_instead_of_emitting_an_unbounded_cursor", async () => {
+    const module = await loadFeedParser();
+    if (!module) return;
+    const longUrl = `https://example.com/${"path".repeat(1300)}`;
+    const body = `<rss><channel><item><link>${longUrl}</link><title>No ID</title></item></channel></rss>`;
+
+    const page = module.parseFeed(body, "application/rss+xml");
+    const candidate = page.candidates[0];
+    const cursor = candidate?.sourceCursor?.value ?? "";
+
+    expect(candidate?.externalId).toBeNull();
+    expect(candidate?.dedupeKey).toBe(candidate?.canonicalUrl);
+    expect(cursor).toBe("__cue_cursor_sha256_v1__:bdd86a8c872c43b0b7bb15d6fa5f13d1cebbe773d37eeac7e09eb592685e5702");
+    expect(new TextEncoder().encode(cursor).byteLength).toBeLessThanOrEqual(4096);
+  });
+
+  it("pages_after_a_hashed_long_ID_without_replay_when_that_ID_is_duplicated", async () => {
+    const module = await loadFeedParser();
+    if (!module) return;
+    const longId = `long-${"z".repeat(5000)}`;
+    const items = [
+      ...Array.from({ length: 99 }, (_, index) => `<item><guid>story-${index}</guid><link>https://example.com/story-${index}</link></item>`),
+      `<item><guid>${longId}</guid><link>https://example.com/long-first</link></item>`,
+      `<item><guid>${longId}</guid><link>https://example.com/long-duplicate</link></item>`,
+      ...Array.from({ length: 6 }, (_, index) => `<item><guid>later-${index}</guid><link>https://example.com/later-${index}</link></item>`),
+    ];
+    const body = `<rss><channel>${items.join("")}</channel></rss>`;
+    const first = module.parseFeed(body, "application/rss+xml");
+    const second = module.parseFeed(body, "application/rss+xml", first.nextCursor ?? undefined);
+
+    expect(first.candidates).toHaveLength(100);
+    expect(first.nextCursor?.value).toMatch(/^__cue_cursor_sha256_v1__:[a-f0-9]{64}$/);
+    expect(second.candidates.map((candidate) => candidate.dedupeKey)).toEqual(Array.from({ length: 6 }, (_, index) => `later-${index}`));
+    expect(second.candidates.some((candidate) => candidate.canonicalUrl === "https://example.com/long-duplicate")).toBe(false);
+    expect(second.hasMore).toBe(false);
+  });
+
   it("deduplicates_repeated_IDs_before_paging_and_keeps_the_first_candidate", async () => {
     const module = await loadFeedParser();
     if (!module) return;
