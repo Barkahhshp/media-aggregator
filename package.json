@@ -1,0 +1,25 @@
+{
+  "name": "media-aggregator",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "wrangler deploy --dry-run --outdir dist --env \"\""
+  },
+  "dependencies": {
+    "hono": "^4.13.18"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.8.2",
+    "@cloudflare/workers-types": "^5.20261116.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.12",
+    "wrangler": "^4.162.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "workerd@1.20261113.1": true
+  }
+}
