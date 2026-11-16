@@ -105,7 +105,7 @@ Tabel utama:
 
 Ukuran 500 KiB dihitung dari bytes UTF-8. Unique constraints mencegah duplikasi `(source_id, external_id)`; fallback `(source_id, canonical_url)` yang dinormalisasi, lalu hash. Item berubah dengan ID sama memperbarui artikel di transaksi D1 yang sama dengan pembaruan FTS. Artikel lintas sumber tidak digabung.
 
-Terapkan batas byte pada seluruh field sebelum menulis: `title` maks. 4 KiB, `summary` maks. 16 KiB, `author` maks. 1 KiB, `canonical_url` maks. 4 KiB, `external_id` maks. 1 KiB, dan `content_text` maks. 500 KiB UTF-8. Validasi ukuran row gabungan terhadap 1,8 MB (di bawah limit D1 2,000,000 bytes) sebelum insert/update; tolak item dengan `row_too_large` daripada membuang konten tanpa pemberitahuan. Tes harus mengisi field gabungan mendekati limit dan memastikan row tidak melampaui batas.
+Terapkan batas byte pada seluruh field sebelum menulis: `title` maks. 4 KiB, `summary` maks. 16 KiB, `author` maks. 1 KiB, `canonical_url` maks. 4 KiB, `external_id` maks. 1 KiB, `published_at` maks. 64 byte UTF-8, dan `content_text` maks. 500 KiB UTF-8. Normalisasi tanggal valid ke RFC3339 UTC; tanggal tidak valid menjadi `NULL`, dan urutan list memakai `fetched_at` sebagai fallback. Validasi ukuran row gabungan terhadap 1,8 MB (di bawah limit D1 2,000,000 bytes) sebelum insert/update; tolak item dengan `row_too_large` daripada membuang konten tanpa pemberitahuan. Tes harus mengisi field gabungan mendekati limit dan memastikan row tidak melampaui batas.
 
 ## REST API
 

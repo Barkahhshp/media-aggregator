@@ -91,9 +91,10 @@
 - `parseFeed(body: string, contentType: string): ParsedFeed` supports RSS, Atom, JSON Feed and returns canonical provisional candidates.
 - `parseSitemap(body: string): ParsedSitemap` supports urlsets and sitemap indexes with cursorable URLs.
 - `extractArticle(html: string, selectors: ArticleSelectors): ExtractedArticle` uses `HTMLRewriter` to extract configured title/summary/author/time/body.
-- Export `Candidate`, `SourceCursor`, `FetchLimits`, `FetchResult`, `ParsedFeed`, `ParsedSitemap`, and `ExtractedArticle` from `src/ingest/types.ts`; `Candidate` carries source ID, dedupe key, canonical URL, provisional metadata, and the source cursor that yielded it.
+- `normalizePublishedAt(value: string | null | undefined): string | null` parses valid dates and serializes them as RFC3339 UTC text; invalid values return `null`. Task 5 article writes call this same helper.
+- Export `Candidate`, `SourceCursor`, `FetchLimits`, `FetchResult`, `ParsedFeed`, `ParsedSitemap`, and `ExtractedArticle` from `src/ingest/types.ts`; `Candidate` carries source ID, dedupe key, canonical URL, provisional metadata, and the source cursor that yielded it. Add `normalizePublishedAt` to `src/ingest/feed-parser.ts`.
 
-- [ ] **Step 1: Write failing parser and URL tests** for normal/encoded/private URLs, multi-hop and cross-host redirects, oversized response, valid RSS/Atom/JSON Feed, >100 sitemap entries, sitemap index, and missing HTML selector.
+- [ ] **Step 1: Write failing parser and URL tests** for normal/encoded/private URLs, multi-hop and cross-host redirects, oversized response, valid RSS/Atom/JSON Feed, >100 sitemap entries, sitemap index, missing HTML selector, normalized UTC timestamp, invalid timestamp → `null`, and >64-byte input.
 - [ ] **Step 2: Run focused tests and verify RED.**
 - [ ] **Step 3: Implement URL validation, manual redirect fetch, bounded feed/sitemap parsers, and selector-based HTML extraction.** Disable XML entity expansion and reject parser payloads exceeding caps.
 - [ ] **Step 4: Run focused tests and full `npm test`; verify GREEN.**
@@ -126,7 +127,7 @@
 **Interfaces:**
 - `runScheduled(env: Env, scheduledTime: number): Promise<ScheduleResult>` processes one source and at most two pending article URLs; it respects one global lease.
 - `checkWriteGate(db: D1Database, writeKind: 'pending' | 'article' | 'source' | 'run', estimatedBytes: number): Promise<'allow' | 'storage_limit'>` uses `meta.size_after`, stops all ingestion writes at 280 MiB and enters read-only growth mode by 300 MiB.
-- `Article` and `ArticleInput` are defined in `src/articles/types.ts`; `saveArticleAndCompletePending(db: D1Database, item: PendingItem, article: ArticleInput): Promise<SaveArticleResult>` applies field caps, combined-row cap 1,800,000 bytes, D1 unique constraints, FTS update, dedupe, and pending deletion in one D1 transaction.
+- `Article` and `ArticleInput` are defined in `src/articles/types.ts`; `saveArticleAndCompletePending(db: D1Database, item: PendingItem, article: ArticleInput): Promise<SaveArticleResult>` calls `normalizePublishedAt` from Task 3, applies field caps including the 64-byte timestamp cap, combined-row cap 1,800,000 bytes, D1 unique constraints, FTS update, dedupe, and pending deletion in one D1 transaction.
 - `leaseToken` must match before committing fetched results; expired global/pending leases may be reclaimed.
 - `runScheduled` checks `system_state.export_lock` before any discovery or write. The source POST route calls `checkWriteGate(..., 'source', bytes)` before inserting; it rejects additions while ingestion is paused or storage-limited.
 
@@ -168,7 +169,7 @@
 
 - [ ] **Step 1: Write failing tests** for export lock, ingestion/config lockout, 30-minute expiry, page row/byte caps with maximum body and pending records, cursor resumption, schema version, inclusion of pending/watermarks, and restore round-trip hashes.
 - [ ] **Step 2: Run focused tests and verify RED.**
-- [ ] **Step 3: Implement export snapshot/page API and local restore script; document Access setup, D1 migration, local tests, D1 Time Travel, NDJSON export, recovery, and resource caps.**
+- [ ] **Step 3: Implement export snapshot/page API and local restore script; document Access setup on the custom hostname and ensure its policy protects both `/health` and `/v1/*`, D1 migration, local tests, D1 Time Travel, NDJSON export, recovery, and resource caps.**
 - [ ] **Step 4: Run focused tests and full `npm test`; verify GREEN.**
 - [ ] **Step 5: Run `npm run lint`, `npm run typecheck`, and `npm run build`; run full test suite; commit `feat: add consistent export and recovery guide`.**
 
