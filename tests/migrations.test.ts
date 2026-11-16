@@ -45,4 +45,29 @@ describe("initial D1 migration", () => {
     expect(tables).toEqual(expect.arrayContaining(requiredTables));
     expect(indexes).toEqual(expect.arrayContaining(requiredIndexes));
   });
+
+  it("published_at_rejects_values_over_64_utf8_bytes", async () => {
+    await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);
+
+    const sourceId = crypto.randomUUID();
+    await testEnv.DB
+      .prepare("INSERT INTO sources (id, url, kind, host) VALUES (?, ?, ?, ?)")
+      .bind(sourceId, "https://example.com/feed", "feed", "example.com")
+      .run();
+
+    const tooLong = "x".repeat(65);
+    await expect(
+      testEnv.DB
+        .prepare("INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, published_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(crypto.randomUUID(), sourceId, "article", crypto.randomUUID(), "https://example.com/pending", tooLong)
+        .run(),
+    ).rejects.toThrow(/CHECK constraint failed/);
+
+    await expect(
+      testEnv.DB
+        .prepare("INSERT INTO articles (id, source_id, canonical_url, title, content_text, content_hash, published_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(crypto.randomUUID(), sourceId, "https://example.com/article", "Test", "", "hash", tooLong)
+        .run(),
+    ).rejects.toThrow(/CHECK constraint failed/);
+  });
 });
