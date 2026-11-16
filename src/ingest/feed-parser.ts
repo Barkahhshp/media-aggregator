@@ -71,7 +71,6 @@ function rssCandidates(root: XmlNode): Candidate[] {
   const items = rootName === "rdf" ? childrenNamed(root, "item") : childrenNamed(channel, "item");
   const output: Candidate[] = [];
   for (const item of items) {
-    if (output.length >= MAX_FEED_CANDIDATES) break;
     const link = firstChildText(item, "link");
     const guidNode = firstChild(item, "guid");
     const guid = nodeText(guidNode).trim();
@@ -103,7 +102,6 @@ function atomCandidates(root: XmlNode): Candidate[] {
   const entries = localName(root.name) === "entry" ? [root] : childrenNamed(root, "entry");
   const output: Candidate[] = [];
   for (const entry of entries) {
-    if (output.length >= MAX_FEED_CANDIDATES) break;
     const id = firstChildText(entry, "id");
     const url = atomLink(entry) || id;
     if (url.length === 0) continue;
@@ -135,7 +133,6 @@ function jsonCandidates(body: string): Candidate[] {
   if (!Array.isArray(items)) throw new Error("JSON Feed items must be an array");
   const output: Candidate[] = [];
   for (const item of items) {
-    if (output.length >= MAX_FEED_CANDIDATES) break;
     if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
     const record = item as Record<string, unknown>;
     const id = typeof record.id === "string" ? record.id : "";
@@ -166,7 +163,27 @@ function jsonCandidates(body: string): Candidate[] {
   return output;
 }
 
-export function parseFeed(body: string, contentType: string): ParsedFeed {
+function pageCandidates(candidates: Candidate[], afterCursor?: SourceCursor): ParsedFeed {
+  let cursorFound = afterCursor === undefined;
+  let startIndex = 0;
+  if (afterCursor !== undefined) {
+    const cursorIndex = candidates.findIndex((candidate) =>
+      candidate.sourceCursor?.kind === afterCursor.kind && candidate.sourceCursor.value === afterCursor.value,
+    );
+    cursorFound = cursorIndex >= 0;
+    if (cursorFound) startIndex = cursorIndex + 1;
+  }
+
+  const page = candidates.slice(startIndex, startIndex + MAX_FEED_CANDIDATES);
+  return {
+    candidates: page,
+    hasMore: startIndex + page.length < candidates.length,
+    cursorFound,
+    nextCursor: page[page.length - 1]?.sourceCursor ?? null,
+  };
+}
+
+export function parseFeed(body: string, contentType: string, afterCursor?: SourceCursor): ParsedFeed {
   if (new TextEncoder().encode(body).byteLength > MAX_FEED_BYTES) throw new Error("Feed payload exceeds the 2 MiB parser limit");
   const candidates = contentType.toLowerCase().includes("json") || body.trimStart().startsWith("{")
     ? jsonCandidates(body)
@@ -184,6 +201,5 @@ export function parseFeed(body: string, contentType: string): ParsedFeed {
           throw new Error("Unsupported XML feed root element");
       }
     })();
-  const nextCursor = candidates[candidates.length - 1]?.sourceCursor ?? null;
-  return { candidates, nextCursor };
+  return pageCandidates(candidates, afterCursor);
 }

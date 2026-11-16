@@ -9,11 +9,23 @@ interface Candidate {
   summary: string | null;
   author: string | null;
   publishedAt: string | null;
-  sourceCursor: unknown;
+  sourceCursor: SourceCursor | null;
+}
+
+interface SourceCursor {
+  kind: "feed" | "sitemap";
+  value: string;
+}
+
+interface ParsedFeed {
+  candidates: Candidate[];
+  hasMore: boolean;
+  cursorFound: boolean;
+  nextCursor: SourceCursor | null;
 }
 
 interface FeedParserModule {
-  parseFeed(body: string, contentType: string): { candidates: Candidate[] };
+  parseFeed(body: string, contentType: string, afterCursor?: SourceCursor): ParsedFeed;
   normalizePublishedAt(value: string | null | undefined): string | null;
 }
 
@@ -150,6 +162,68 @@ describe("feed parsing", () => {
     const result = module.parseFeed(`<rss><channel>${items}</channel></rss>`, "application/rss+xml");
 
     expect(result.candidates).toHaveLength(100);
+  });
+
+  it.each(["RSS", "Atom", "JSON Feed"] as const)("pages_all_%s_entries_beyond_100_until_every_candidate_is_emitted", async (format) => {
+    const module = await loadFeedParser();
+    if (!module) return;
+
+    const slug = format === "RSS" ? "rss-paged" : format === "Atom" ? "atom-paged" : "json-paged";
+    const urls = Array.from({ length: 205 }, (_, index) => `https://example.com/${slug}-${index}`);
+    const body = format === "RSS"
+      ? `<rss><channel>${urls.map((url, index) => `<item><guid>${slug}-${index}</guid><link>${url}</link><title>Page ${index}</title></item>`).join("")}</channel></rss>`
+      : format === "Atom"
+        ? `<feed xmlns="http://www.w3.org/2005/Atom">${urls.map((url, index) => `<entry><id>${slug}-${index}</id><link rel="alternate" href="${url}"/><title>Page ${index}</title></entry>`).join("")}</feed>`
+        : JSON.stringify({ version: "https://jsonfeed.org/version/1.1", items: urls.map((url, index) => ({ id: `${slug}-${index}`, url, title: `Page ${index}` })) });
+    const contentType = format === "RSS" ? "application/rss+xml" : format === "Atom" ? "application/atom+xml" : "application/feed+json";
+    const yieldedUrls: string[] = [];
+    let afterCursor: SourceCursor | undefined;
+    let pageCount = 0;
+    let hasMore = true;
+
+    while (hasMore) {
+      const page = module.parseFeed(body, contentType, afterCursor);
+      pageCount += 1;
+      expect(page.cursorFound).toBe(true);
+      expect(page.candidates.length).toBeLessThanOrEqual(100);
+      yieldedUrls.push(...page.candidates.map((candidate) => candidate.canonicalUrl));
+      hasMore = page.hasMore;
+      afterCursor = page.nextCursor ?? undefined;
+      expect(pageCount).toBeLessThanOrEqual(3);
+    }
+
+    expect(pageCount).toBe(3);
+    expect(yieldedUrls).toHaveLength(205);
+    expect(yieldedUrls[0]).toBe(urls[0]);
+    expect(yieldedUrls[204]).toBe(urls[204]);
+    expect(new Set(yieldedUrls).size).toBe(205);
+  });
+
+  it("restarts_from_the_first_page_when_the_saved_cursor_is_missing", async () => {
+    const module = await loadFeedParser();
+    if (!module) return;
+
+    const body = `<rss><channel><item><guid>first</guid><link>https://example.com/first</link></item><item><guid>second</guid><link>https://example.com/second</link></item></channel></rss>`;
+    const page = module.parseFeed(body, "application/rss+xml", { kind: "feed", value: "deleted-from-current-feed" });
+
+    expect(page.cursorFound).toBe(false);
+    expect(page.candidates[0]?.canonicalUrl).toBe("https://example.com/first");
+    expect(page.hasMore).toBe(false);
+    expect(page.nextCursor).toEqual({ kind: "feed", value: "second" });
+  });
+
+  it("returns_an_empty_page_after_a_valid_last_cursor_for_poll_reset", async () => {
+    const module = await loadFeedParser();
+    if (!module) return;
+
+    const body = `<rss><channel><item><guid>last</guid><link>https://example.com/last</link></item></channel></rss>`;
+    const firstPage = module.parseFeed(body, "application/rss+xml");
+    const emptyPage = module.parseFeed(body, "application/rss+xml", firstPage.nextCursor ?? undefined);
+
+    expect(emptyPage.candidates).toEqual([]);
+    expect(emptyPage.cursorFound).toBe(true);
+    expect(emptyPage.hasMore).toBe(false);
+    expect(emptyPage.nextCursor).toBeNull();
   });
 
   it("rejects_XML_DTD_and_entity_expansion_payloads", async () => {

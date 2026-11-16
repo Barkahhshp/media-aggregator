@@ -31,6 +31,8 @@ export interface FetchResult {
 
 export interface ParsedFeed {
   candidates: Candidate[];
+  hasMore: boolean;
+  cursorFound: boolean;
   nextCursor: SourceCursor | null;
 }
 
