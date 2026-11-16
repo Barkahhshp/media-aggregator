@@ -9,7 +9,7 @@ const MAX_SOURCE_HOST_BYTES = 255;
 
 const sourceKinds: readonly SourceKind[] = ["feed", "sitemap", "article", "html_list"];
 const allowedInputKeys = new Set(["kind", "url", "poll_interval_sec", "selectors"]);
-const selectorKeys = new Set(["title", "summary", "author", "publishedAt", "body"]);
+const selectorKeys = new Set(["title", "summary", "author", "publishedAt", "body", "itemLink"]);
 
 function error(status: number, code: string, message: string): ApiError {
   return { status, code, message };
@@ -19,7 +19,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validateSelectors(value: unknown): ArticleSelectors | ApiError {
+function validateSelectors(value: unknown, kind: "article" | "html_list"): ArticleSelectors | ApiError {
   if (!isRecord(value)) {
     return error(400, "invalid_selectors", "Selectors must be an object");
   }
@@ -36,12 +36,22 @@ function validateSelectors(value: unknown): ArticleSelectors | ApiError {
       return error(400, "invalid_selectors", `Selector ${optional} must be a string`);
     }
   }
+  if (kind === "html_list" && (typeof value.itemLink !== "string" || value.itemLink.trim().length === 0)) {
+    return error(400, "invalid_selectors", "Selector itemLink is required for html_list sources");
+  }
+  if (kind === "article" && value.itemLink !== undefined) {
+    return error(400, "invalid_selectors", "Selector itemLink is only supported for html_list sources");
+  }
+  if (value.itemLink !== undefined && typeof value.itemLink !== "string") {
+    return error(400, "invalid_selectors", "Selector itemLink must be a string");
+  }
   return {
     title: value.title as string,
     body: value.body as string,
     ...(value.summary === undefined ? {} : { summary: value.summary as string }),
     ...(value.author === undefined ? {} : { author: value.author as string }),
     ...(value.publishedAt === undefined ? {} : { publishedAt: value.publishedAt as string }),
+    ...(value.itemLink === undefined ? {} : { itemLink: value.itemLink as string }),
   };
 }
 
@@ -106,7 +116,7 @@ export function validateSourceInput(input: unknown): SourceInput | ApiError {
 
   let selectors: ArticleSelectors | undefined;
   if (input.kind === "article" || input.kind === "html_list") {
-    const checked = validateSelectors(input.selectors);
+    const checked = validateSelectors(input.selectors, input.kind);
     if (isApiError(checked)) return checked;
     selectors = checked as ArticleSelectors;
   } else if (input.selectors !== undefined) {

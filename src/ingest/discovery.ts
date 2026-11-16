@@ -1,6 +1,7 @@
 import { normalizeAndValidateUrl } from "./url-policy";
 import { parseFeed } from "./feed-parser";
 import { parseSitemap } from "./sitemap-parser";
+import { extractHtmlListLinks } from "./html-extractor";
 import { enqueueCandidates, type EnqueueResult, type PendingBudget } from "./pending-repository";
 import { checkWriteGate, completeWriteReservation, D1_STORAGE_STOP_BYTES } from "./storage-guard";
 import type { Candidate } from "./types";
@@ -130,7 +131,10 @@ export async function discoverSource(
 
   if (source.kind === "sitemap") {
     const parsed = parseSitemap(body);
-    const savedCursor = source.sitemap_last_loc ?? undefined;
+    const childCursor = budget.pendingSitemapId === undefined ? null : budget.pendingSitemapCursor ?? null;
+    const savedCursor = budget.pendingSitemapId === undefined
+      ? source.sitemap_last_loc ?? undefined
+      : childCursor ?? undefined;
     const cursorIndex = savedCursor === undefined
       ? -1
       : parsed.locations.findIndex((location) => location.sourceCursor.value === savedCursor);
@@ -138,7 +142,7 @@ export async function discoverSource(
     const startIndex = savedCursor === undefined || cursorIndex < 0 ? 0 : cursorIndex + 1;
     const remaining = parsed.locations.slice(startIndex);
     if (remaining.length === 0) {
-      const reset = cursorFound && source.sitemap_last_loc !== null
+      const reset = budget.pendingSitemapId === undefined && cursorFound && source.sitemap_last_loc !== null
         ? await resetCursor(db, source.id, "sitemap_last_loc", source.sitemap_last_loc)
         : { reset: false, storageLimit: false };
       return {
@@ -172,4 +176,46 @@ export async function discoverSource(
   }
 
   return fallbackResult(true, false, "unsupported_source");
+}
+
+export async function discoverHtmlList(
+  db: D1Database,
+  source: Source,
+  body: string,
+  budget: PendingBudget = {},
+  listUrl = source.url,
+): Promise<DiscoveryResult> {
+  if (!source.enabled || source.kind !== "html_list" || source.selectors?.itemLink === undefined) {
+    return fallbackResult(true, false, "unsupported_source");
+  }
+
+  const candidates = await extractHtmlListLinks(body, listUrl, source.selectors.itemLink);
+  const savedCursor = source.feed_watermark ?? undefined;
+  const cursorIndex = savedCursor === undefined
+    ? -1
+    : candidates.findIndex((candidate) => candidate.sourceCursor?.value === savedCursor);
+  const cursorFound = savedCursor === undefined || cursorIndex >= 0;
+  const startIndex = savedCursor === undefined || cursorIndex < 0 ? 0 : cursorIndex + 1;
+  const remaining = candidates.slice(startIndex);
+  if (remaining.length === 0) {
+    const reset = cursorFound && source.feed_watermark !== null
+      ? await resetCursor(db, source.id, "feed_watermark", source.feed_watermark)
+      : { reset: false, storageLimit: false };
+    return {
+      ...fallbackResult(cursorFound, reset.storageLimit && !reset.reset, reset.storageLimit ? "storage_limit" : null),
+      cursorReset: reset.reset,
+    };
+  }
+
+  const page = remaining.slice(0, MAX_DISCOVERY_CANDIDATES);
+  const articleCandidates = page.map((candidate) => markHostMismatch(candidate, source, "article"));
+  const stored = await enqueueCandidates(db, source, articleCandidates, budget);
+  return {
+    ...stored,
+    enqueued: stored.inserted,
+    cursorFound,
+    cursorReset: false,
+    blocked: stored.blocked,
+    hasMore: stored.hasMore || remaining.length > page.length,
+  };
 }

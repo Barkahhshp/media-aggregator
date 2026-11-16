@@ -5,6 +5,7 @@ export interface ArticleSelectors {
   summary?: string;
   author?: string;
   publishedAt?: string;
+  itemLink?: string;
   body: string;
 }
 

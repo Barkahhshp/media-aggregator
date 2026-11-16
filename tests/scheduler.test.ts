@@ -66,12 +66,16 @@ async function loadScheduler() {
 
 async function makeSource(kind: SourceKind = "feed", suffix = "one", nextFetchAt = 1): Promise<Source> {
   const id = `source-${suffix}`;
-  const url = `https://example.com/${kind === "sitemap" ? "sitemap" : "feed"}-${suffix}`;
+  const url = kind === "sitemap"
+    ? `https://example.com/sitemap-${suffix}`
+    : kind === "html_list"
+      ? `https://example.com/news/listing-${suffix}/`
+      : `https://example.com/feed-${suffix}`;
   await testEnv.DB.prepare(`
     INSERT INTO sources (id, url, kind, host, next_fetch_at, poll_interval_sec, selectors_json)
     VALUES (?, ?, ?, 'example.com', ?, 900, ?)
   `).bind(id, url, kind, nextFetchAt, kind === "article" || kind === "html_list"
-    ? JSON.stringify({ title: "h1", summary: ".summary", body: "article" })
+    ? JSON.stringify({ title: "h1", summary: ".summary", body: "article", ...(kind === "html_list" ? { itemLink: "a.story-link" } : {}) })
     : null).run();
   const source = await getSource(testEnv.DB, id);
   if (!source) throw new Error("Expected test source");
@@ -292,6 +296,31 @@ describe("scheduled ingestion", () => {
       .toMatchObject({ export_lock: 0, export_lock_id: null, export_lock_expires_at: null });
   });
 
+  it("uses_execution_wall_clock_for_due_sources_and_global_lease_when_scheduled_delivery_is_delayed", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    const executionMs = 2_000_000_000_000;
+    const executionSeconds = executionMs / 1000;
+    vi.spyOn(Date, "now").mockReturnValue(executionMs);
+    const source = await makeSource("feed", "delayed-event", executionSeconds - 10);
+    let releaseFetch: ((response: Response) => void) | undefined;
+    const fetchGate = new Promise<Response>((resolve) => { releaseFetch = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async () => fetchGate));
+
+    const delayedScheduledTime = executionMs - 10 * 60 * 1000;
+    const run = scheduler.runScheduled(testEnv, delayedScheduledTime);
+    for (let attempt = 0; attempt < 100 && vi.mocked(fetch).mock.calls.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const lease = await testEnv.DB.prepare("SELECT global_lease_expires_at FROM system_state WHERE singleton_id = 'global'").first<{ global_lease_expires_at: number | null }>();
+    releaseFetch?.(new Response("<rss><channel></channel></rss>", { status: 200, headers: { "Content-Type": "application/rss+xml" } }));
+    const result = await run;
+
+    expect(result.sourcesProcessed).toBe(1);
+    expect(lease?.global_lease_expires_at).toBe(executionSeconds + 60);
+    expect(await sourceState(source.id)).toMatchObject({ last_fetched_at: executionSeconds });
+  });
+
   it("purges_expired_terminal_pending_records_during_scheduled_runs", async () => {
     const scheduler = await loadScheduler();
     if (!scheduler) return;
@@ -339,6 +368,115 @@ describe("scheduled ingestion", () => {
     expect(result.sitemapFetches).toBe(1);
     expect(parent).toMatchObject({ status: "retry_wait" });
     expect(childCount?.count).toBe(10);
+  });
+
+  it("drains_more_than_ten_urls_from_each_sitemap_child_without_cursor_starvation", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    let now = Math.floor(Date.now() / 1000);
+    vi.spyOn(Date, "now").mockImplementation(() => now * 1000);
+    const source = await makeSource("sitemap", "multi-child", now);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.href === source.url) {
+        return new Response('<sitemapindex><sitemap><loc>https://example.com/child-a.xml</loc></sitemap><sitemap><loc>https://example.com/child-b.xml</loc></sitemap></sitemapindex>', {
+          status: 200,
+          headers: { "Content-Type": "application/xml" },
+        });
+      }
+      if (url.pathname.endsWith("child-a.xml") || url.pathname.endsWith("child-b.xml")) {
+        const prefix = url.pathname.includes("child-a") ? "a" : "b";
+        const entries = Array.from({ length: 12 }, (_, index) =>
+          `<url><loc>https://example.com/story-${prefix}-${index}</loc></url>`).join("");
+        return new Response(`<urlset>${entries}</urlset>`, { status: 200, headers: { "Content-Type": "application/xml" } });
+      }
+      return new Response(htmlArticle(`Fetched ${url.pathname}`), { status: 200, headers: { "Content-Type": "text/html" } });
+    }));
+
+    const startedAt = now;
+    await scheduler.runScheduled(testEnv, startedAt * 1000);
+    expect(await testEnv.DB.prepare("SELECT sitemap_last_loc FROM sources WHERE id = ?").bind(source.id).first())
+      .toMatchObject({ sitemap_last_loc: "https://example.com/child-b.xml" });
+    await testEnv.DB.prepare(`UPDATE pending_items SET discovered_at = CASE canonical_url
+      WHEN 'https://example.com/child-a.xml' THEN 1 ELSE 2 END WHERE source_id = ? AND item_type = 'sitemap'`)
+      .bind(source.id).run();
+
+    now = startedAt + 1;
+    await scheduler.runScheduled(testEnv, now * 1000);
+    let childCursors = await testEnv.DB.prepare("SELECT canonical_url, sitemap_cursor FROM pending_items WHERE source_id = ? AND item_type = 'sitemap' ORDER BY canonical_url")
+      .bind(source.id).all<{ canonical_url: string; sitemap_cursor: string | null }>();
+    expect(childCursors.results).toEqual([
+      { canonical_url: "https://example.com/child-a.xml", sitemap_cursor: "https://example.com/story-a-9" },
+      { canonical_url: "https://example.com/child-b.xml", sitemap_cursor: null },
+    ]);
+    expect(await testEnv.DB.prepare("SELECT sitemap_last_loc FROM sources WHERE id = ?").bind(source.id).first())
+      .toMatchObject({ sitemap_last_loc: "https://example.com/child-b.xml" });
+
+    now = startedAt + 2;
+    await scheduler.runScheduled(testEnv, now * 1000);
+    childCursors = await testEnv.DB.prepare("SELECT canonical_url, sitemap_cursor FROM pending_items WHERE source_id = ? AND item_type = 'sitemap' ORDER BY canonical_url")
+      .bind(source.id).all<{ canonical_url: string; sitemap_cursor: string | null }>();
+    expect(childCursors.results).toEqual([
+      { canonical_url: "https://example.com/child-a.xml", sitemap_cursor: "https://example.com/story-a-9" },
+      { canonical_url: "https://example.com/child-b.xml", sitemap_cursor: "https://example.com/story-b-9" },
+    ]);
+    expect(await testEnv.DB.prepare("SELECT sitemap_last_loc FROM sources WHERE id = ?").bind(source.id).first())
+      .toMatchObject({ sitemap_last_loc: "https://example.com/child-b.xml" });
+
+    for (const offset of [901, 902]) {
+      now = startedAt + offset;
+      await scheduler.runScheduled(testEnv, now * 1000);
+    }
+
+    const total = await testEnv.DB.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM articles WHERE source_id = ?) +
+        (SELECT COUNT(*) FROM pending_items WHERE source_id = ? AND item_type = 'article') AS count
+    `).bind(source.id, source.id).first<{ count: number }>();
+    const discoveredUrls = await testEnv.DB.prepare(`
+      SELECT canonical_url FROM articles WHERE source_id = ?
+      UNION ALL SELECT canonical_url FROM pending_items WHERE source_id = ? AND item_type = 'article'
+      ORDER BY canonical_url
+    `).bind(source.id, source.id).all<{ canonical_url: string }>();
+    expect(total?.count).toBe(24);
+    expect(discoveredUrls.results.map((row) => row.canonical_url)).toEqual(
+      Array.from(["a", "b"].flatMap((prefix) => Array.from({ length: 12 }, (_, index) => `https://example.com/story-${prefix}-${index}`))).sort(),
+    );
+  });
+
+  it("discovers_html_list_links_then_applies_article_content_selectors", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    const source = await makeSource("html_list", "listing", 1);
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requests.push(url);
+      if (url === source.url) {
+        return new Response('<a class="story-link" href="story/one">Story one</a><a class="story-link" href="https://elsewhere.com/story">External</a><a class="story-link" href="javascript:alert(1)">Unsafe</a>', {
+          status: 200,
+          headers: { "Content-Type": "text/html", ETag: '"list-v1"' },
+        });
+      }
+      return new Response(htmlArticle("Fetched listing article"), { status: 200, headers: { "Content-Type": "text/html" } });
+    }));
+
+    const result = await scheduler.runScheduled(testEnv, 1_000);
+    const article = await testEnv.DB.prepare("SELECT canonical_url, title, content_text FROM articles WHERE source_id = ?").bind(source.id)
+      .first<{ canonical_url: string; title: string; content_text: string }>();
+
+    expect(requests).toEqual([source.url, "https://example.com/news/listing-listing/story/one"]);
+    expect(result.discovered).toBe(3);
+    expect(article).toMatchObject({
+      canonical_url: "https://example.com/news/listing-listing/story/one",
+      title: "Fetched listing article",
+      content_text: expect.stringContaining("Article body."),
+    });
+    const terminalRows = await testEnv.DB.prepare("SELECT canonical_url, dedupe_key, last_error FROM pending_items WHERE source_id = ? AND status = 'blocked'")
+      .bind(source.id).all<{ canonical_url: string; dedupe_key: string; last_error: string }>();
+    expect(terminalRows.results).toHaveLength(2);
+    expect(JSON.stringify(terminalRows.results)).not.toContain("elsewhere.com");
+    expect(JSON.stringify(terminalRows.results)).not.toContain("javascript:");
   });
 
   it("respects_Retry_After_and_surfaces_article_HTTP_failures_in_source_and_run_status", async () => {

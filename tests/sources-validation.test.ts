@@ -38,7 +38,7 @@ describe("source input validation", () => {
     { kind: "feed", url: "https://example.com/feed.xml" },
     { kind: "sitemap", url: "https://example.com/sitemap.xml" },
     { kind: "article", url: "https://example.com/story", selectors: articleSelectors },
-    { kind: "html_list", url: "https://example.com/news", selectors: articleSelectors },
+    { kind: "html_list", url: "https://example.com/news", selectors: { ...articleSelectors, itemLink: "a.story-link" } },
   ])("accepts valid $kind sources", async (input) => {
     const validateSourceInput = await loadValidateSourceInput();
     if (!validateSourceInput) return;
@@ -50,6 +50,22 @@ describe("source input validation", () => {
       url: input.url,
       poll_interval_sec: 7200,
     });
+  });
+
+  it("requires_itemLink_for_html_list_sources", async () => {
+    const validateSourceInput = await loadValidateSourceInput();
+    if (!validateSourceInput) return;
+
+    expect(validateSourceInput({ kind: "html_list", url: "https://example.com/news", selectors: articleSelectors }))
+      .toMatchObject({ status: 400, code: "invalid_selectors" });
+  });
+
+  it("rejects_itemLink_on_single_article_sources", async () => {
+    const validateSourceInput = await loadValidateSourceInput();
+    if (!validateSourceInput) return;
+
+    expect(validateSourceInput({ kind: "article", url: "https://example.com/story", selectors: { ...articleSelectors, itemLink: "a.story-link" } }))
+      .toMatchObject({ status: 400, code: "invalid_selectors" });
   });
 
   it("rejects_an_unknown_source_kind", async () => {

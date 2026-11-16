@@ -139,6 +139,16 @@ sources.patch("/v1/sources/:id", async (context) => {
     return apiErrorResponse({ status: 404, code: "source_not_found", message: "Source not found" }, context.req.raw);
   }
   const update = patch as SourcePatchInput;
+  const disableOnly = update.enabled === false
+    && update.poll_interval_sec === undefined
+    && update.selectors === undefined;
+  if (disableOnly) {
+    const source = await disableSource(context.env.DB, current.id);
+    if (source === null) {
+      return apiErrorResponse({ status: 404, code: "source_not_found", message: "Source not found" }, context.req.raw);
+    }
+    return context.json({ source });
+  }
   const candidate = validateSourceInput({
     kind: current.kind,
     url: current.url,
@@ -148,9 +158,6 @@ sources.patch("/v1/sources/:id", async (context) => {
   if (isApiError(candidate)) return apiErrorResponse(candidate, context.req.raw);
 
   const now = Math.floor(Date.now() / 1000);
-  const disableOnly = update.enabled === false
-    && update.poll_interval_sec === undefined
-    && update.selectors === undefined;
   const exportLock = await context.env.DB.prepare(
     "SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'",
   ).first<{ export_lock: number; export_lock_expires_at: number | null }>();

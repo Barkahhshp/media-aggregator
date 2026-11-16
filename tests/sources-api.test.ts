@@ -113,6 +113,20 @@ describe("source management API", () => {
     expect(updated.source).toMatchObject({ enabled: false, poll_interval_sec: 900 });
   });
 
+  it("allows_disabling_a_legacy_html_list_source_without_itemLink", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    await testEnv.DB.prepare(`
+      INSERT INTO sources (id, url, kind, host, selectors_json)
+      VALUES ('legacy-list', 'https://example.com/news/', 'html_list', 'example.com', '{"title":"h1","body":"article"}')
+    `).run();
+
+    const response = await sourceRequest(app, "/v1/sources/legacy-list", "PATCH", { enabled: false });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ source: { id: "legacy-list", enabled: false } });
+  });
+
   it("rejects_new_sources_when_physical_storage_is_limited", async () => {
     const app = await loadApp();
     if (!app) return;

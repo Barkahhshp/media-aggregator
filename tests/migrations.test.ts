@@ -84,4 +84,17 @@ describe("initial D1 migration", () => {
     expect(reservationTable?.name).toBe("storage_write_reservations");
     expect(reservationIndex?.name).toBe("idx_storage_reservations_expiry");
   });
+
+  it("stores_a_bounded_cursor_on_each_pending_sitemap_item", async () => {
+    await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);
+
+    const columns = await testEnv.DB.prepare("PRAGMA table_info(pending_items)").all<{ name: string }>();
+    expect(columns.results.map((column) => column.name)).toContain("sitemap_cursor");
+
+    await testEnv.DB.prepare("INSERT INTO sources (id, url, kind, host) VALUES ('sitemap-source', 'https://example.com/sitemap.xml', 'sitemap', 'example.com')").run();
+    await expect(testEnv.DB.prepare(`
+      INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, sitemap_cursor)
+      VALUES ('oversized-child-cursor', 'sitemap-source', 'sitemap', 'https://example.com/child.xml', 'https://example.com/child.xml', ?)
+    `).bind("x".repeat(4097)).run()).rejects.toThrow(/CHECK constraint failed/);
+  });
 });

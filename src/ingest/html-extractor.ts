@@ -1,5 +1,9 @@
 import type { ArticleSelectors } from "../sources/types";
-import type { ExtractedArticle } from "./types";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+import { stableCursorValue } from "./cursor";
+import { normalizeAndValidateUrl } from "./url-policy";
+import type { Candidate, ExtractedArticle } from "./types";
 
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
 const VOID_ELEMENTS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
@@ -81,4 +85,83 @@ export async function extractArticle(html: string, selectors: ArticleSelectors):
     publishedAt: publishedValue.length === 0 ? null : publishedValue,
     body: normalizedText(body.result.value),
   };
+}
+
+const SAFE_METADATA_URL_PREFIX = "https://metadata.invalid/sha256/";
+
+function hash(value: string): string {
+  return bytesToHex(sha256(new TextEncoder().encode(value)));
+}
+
+function normalizedHost(host: string): string {
+  return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1).toLowerCase() : host.toLowerCase().replace(/\.$/u, "");
+}
+
+function terminalLinkCandidate(value: string, code: "blocked_unsafe_url" | "blocked_external_host"): Candidate {
+  const identity = `__cue_html_list_sha256_v1__:${hash(value)}`;
+  return {
+    dedupeKey: identity,
+    canonicalUrl: `${SAFE_METADATA_URL_PREFIX}${hash(value)}`,
+    externalId: null,
+    title: null,
+    summary: null,
+    author: null,
+    publishedAt: null,
+    sourceCursor: { kind: "feed", value: stableCursorValue(identity) },
+    terminalFailure: {
+      status: "blocked",
+      code,
+      message: code === "blocked_external_host"
+        ? "HTML list link host differs from its source host"
+        : "HTML list link is not a permitted public URL",
+    },
+  };
+}
+
+export async function extractHtmlListLinks(html: string, listUrl: string, itemLinkSelector: string): Promise<Candidate[]> {
+  if (new TextEncoder().encode(html).byteLength > MAX_HTML_BYTES) {
+    throw new Error("HTML payload exceeds the 2 MiB parser limit");
+  }
+
+  const base = normalizeAndValidateUrl(listUrl);
+  const hrefs: string[] = [];
+  const rewriter = new HTMLRewriter().on(itemLinkSelector, {
+    element(element) {
+      const href = element.getAttribute("href");
+      if (href !== null && href.trim().length > 0) hrefs.push(href.trim());
+    },
+  });
+  await rewriter.transform(new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } })).text();
+
+  const candidates: Candidate[] = [];
+  const seen = new Set<string>();
+  for (const href of hrefs) {
+    let candidate: Candidate;
+    try {
+      const resolved = new URL(href, base);
+      resolved.hash = "";
+      const safe = normalizeAndValidateUrl(resolved.href);
+      if (normalizedHost(safe.hostname) !== normalizedHost(base.hostname)) {
+        candidate = terminalLinkCandidate(safe.href, "blocked_external_host");
+      } else {
+        const identity = safe.href;
+        candidate = {
+          dedupeKey: identity,
+          canonicalUrl: identity,
+          externalId: null,
+          title: null,
+          summary: null,
+          author: null,
+          publishedAt: null,
+          sourceCursor: { kind: "feed", value: stableCursorValue(identity) },
+        };
+      }
+    } catch {
+      candidate = terminalLinkCandidate(href, "blocked_unsafe_url");
+    }
+    if (seen.has(candidate.dedupeKey)) continue;
+    seen.add(candidate.dedupeKey);
+    candidates.push(candidate);
+  }
+  return candidates;
 }

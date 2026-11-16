@@ -33,6 +33,7 @@ CREATE TABLE pending_items (
   next_attempt_at INTEGER NOT NULL DEFAULT (unixepoch()),
   lease_token TEXT,
   lease_expires_at INTEGER,
+  sitemap_cursor TEXT CHECK (sitemap_cursor IS NULL OR length(CAST(sitemap_cursor AS BLOB)) <= 4096),
   last_error TEXT CHECK (last_error IS NULL OR length(CAST(last_error AS BLOB)) <= 1024),
   terminal_expires_at INTEGER,
   discovered_at INTEGER NOT NULL DEFAULT (unixepoch()),

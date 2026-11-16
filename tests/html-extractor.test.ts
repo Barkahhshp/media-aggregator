@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ArticleSelectors } from "../src/sources/types";
+import type { Candidate } from "../src/ingest/types";
 
 interface ExtractedArticle {
   title: string | null;
@@ -11,6 +12,7 @@ interface ExtractedArticle {
 
 interface HtmlExtractorModule {
   extractArticle(html: string, selectors: ArticleSelectors): Promise<ExtractedArticle>;
+  extractHtmlListLinks(html: string, listUrl: string, itemLinkSelector: string): Promise<Candidate[]>;
 }
 
 const extractorModules = import.meta.glob<HtmlExtractorModule>("../src/ingest/html-extractor.ts");
@@ -104,5 +106,28 @@ describe("HTML article extraction", () => {
     if (!extractArticle) return;
 
     await expect(extractArticle(`<article>${"x".repeat(2 * 1024 * 1024)}</article>`, selectors)).rejects.toThrow();
+  });
+
+  it("extracts_unique_relative_links_and_redacts_unsafe_list_urls", async () => {
+    const moduleLoader = extractorModules["../src/ingest/html-extractor.ts"];
+    expect(moduleLoader).toBeDefined();
+    if (!moduleLoader) return;
+    const module = await moduleLoader();
+    const unsafe = "javascript:alert(1)";
+    const candidates = await module.extractHtmlListLinks(`
+      <a class="story-link" href="/story/1">First</a>
+      <a class="story-link" href="https://example.com/story/1#again">Duplicate</a>
+      <a class="story-link" href="https://evil.com/private">External</a>
+      <a class="story-link" href="${unsafe}">Unsafe</a>
+    `, "https://example.com/news", "a.story-link");
+
+    expect(candidates).toHaveLength(3);
+    expect(candidates[0]).toMatchObject({ canonicalUrl: "https://example.com/story/1", dedupeKey: "https://example.com/story/1" });
+    expect(candidates[1]?.terminalFailure).toMatchObject({ status: "blocked", code: "blocked_external_host" });
+    expect(candidates[1]?.canonicalUrl).not.toContain("evil.com");
+    expect(candidates[1]?.dedupeKey).not.toContain("evil.com");
+    expect(candidates[2]?.terminalFailure).toMatchObject({ status: "blocked", code: "blocked_unsafe_url" });
+    expect(candidates[2]?.canonicalUrl).not.toContain(unsafe);
+    expect(candidates[2]?.dedupeKey).not.toContain(unsafe);
   });
 });

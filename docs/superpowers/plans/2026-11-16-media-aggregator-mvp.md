@@ -69,10 +69,10 @@
 
 **Interfaces:**
 - `authenticateLocal(request: Request, env: Env): Response | null` requires `Authorization: Bearer <API_TOKEN>` in test/local; production trusts the Access-protected route and rejects calls without Access assertion header.
-- `Source`, `SourceInput`, and `ArticleSelectors` are defined in `src/sources/types.ts`; `ArticleSelectors` is `{ title: string; summary?: string; author?: string; publishedAt?: string; body: string }`; Task 3 imports this exact type.
+- `Source`, `SourceInput`, and `ArticleSelectors` are defined in `src/sources/types.ts`; `ArticleSelectors` is `{ title: string; summary?: string; author?: string; publishedAt?: string; itemLink?: string; body: string }`; `itemLink` is required by validation for `html_list` only, and Task 3 article extraction keeps using title/body selectors.
 - `validateSourceInput(input: unknown): SourceInput | ApiError` validates kind, URL, interval, selectors, and encoded byte limits.
 - `createSource(db: D1Database, input: SourceInput): Promise<Source>`; `updateSource(...)`; `listSources(...)`; `disableSource(...)`.
-- `SourceInput` supports `feed`, `sitemap`, `article`, and `html_list`; HTML selectors are explicit fields.
+- `SourceInput` supports `feed`, `sitemap`, `article`, and `html_list`; `html_list` requires `selectors.itemLink` to extract list-page hrefs, while the other configured selectors apply to fetched article pages.
 
 - [ ] **Step 1: Write failing tests** for missing/wrong local token, correct local token, production refusing to treat local `API_TOKEN` as Access authentication, valid/invalid source kinds, max 100 active sources, default interval 7,200 seconds, minimum 900 seconds, and source body limits.
 - [ ] **Step 2: Run focused tests and verify RED.**
@@ -131,15 +131,17 @@
 - Test: `tests/scheduler.test.ts`, `tests/article-store.test.ts`, `tests/storage-guard.test.ts`
 
 **Interfaces:**
-- `runScheduled(env: Env, scheduledTime: number): Promise<ScheduleResult>` processes one source and at most two pending article URLs; it respects one global lease.
+- `runScheduled(env: Env, scheduledTime: number): Promise<ScheduleResult>` processes one due source and at most two pending article URLs; it respects one global lease. Execution wall-clock time (`Date.now()`) governs eligibility, lease expiry, cleanup, status updates and retries; `scheduledTime` is reporting-only.
+- A configured top-level sitemap document keeps its cursor in `sources.sitemap_last_loc`; each pending child URL-set keeps its independent `sitemap_cursor`, updated only after successful persistence/dedupe under the child's active lease.
+- `discoverHtmlList(db, source, body, budget)` resolves `itemLink` hrefs against the listing URL, enforces public/same-host URL policy, and sends redacted unsafe/cross-host terminal candidates through the bounded pending write path.
 - `checkWriteGate(db: D1Database, writeKind: 'pending' | 'article' | 'source' | 'run', estimatedBytes: number): Promise<WriteReservation | 'storage_limit'>` uses `meta.size_after`, reserves estimated growth against concurrent gated writes, stops at 280 MiB and enters read-only growth mode by 300 MiB; writers release reservations after writes with the actual `meta.size_after`.
 - `Article` and `ArticleInput` are defined in `src/articles/types.ts`; `saveArticleAndCompletePending(db: D1Database, item: PendingItem, article: ArticleInput): Promise<SaveArticleResult>` calls `normalizePublishedAt` from Task 3, applies field caps including the 64-byte timestamp cap, combined-row cap 1,800,000 bytes, D1 unique constraints, FTS update, dedupe, and pending deletion in one D1 transaction.
 - `leaseToken` must match before committing fetched results; expired global/pending leases may be reclaimed.
 - `runScheduled` checks `system_state.export_lock` before any discovery or write. The source POST route calls `checkWriteGate(..., 'source', bytes)` before inserting; it rejects additions while ingestion is paused or storage-limited.
 
-- [ ] **Step 1: Write failing tests** for scheduled source selection, feed/sitemap discovery, max one source + two article fetches, backlog priority, retry/backoff, `Retry-After`, concurrent Cron lease, `blocked` status, article limits, pending completion atomicity, and sustained D1 overload.
+- [ ] **Step 1: Write failing tests** for scheduled source selection, feed/sitemap and html_list discovery, independent multi-child sitemap cursors with >10 URLs per child, delayed Cron delivery using execution wall-clock, max one source + two article fetches, backlog priority, retry/backoff, `Retry-After`, concurrent Cron lease, `blocked` status, article limits, pending completion atomicity, and sustained D1 overload.
 - [ ] **Step 2: Run focused tests and verify RED.**
-- [ ] **Step 3: Extend the Task 4 storage gate to article/source/run writes, then implement scheduler, global lease, full-text article fetch, D1 transactional persistence, row/index caps, and fetch-run logging.** Reject new sources and discovery at the gate; allow only read/export/disable/delete operations.
+- [ ] **Step 3: Extend the Task 4 storage gate to article/source/run writes, then implement scheduler, global lease, full-text article fetch, list-page link discovery, per-child sitemap cursors, D1 transactional persistence, row/index caps, and fetch-run logging.** Use `Date.now()` for scheduling state, reject new sources and discovery at the gate, and allow only read/export/disable/delete operations when storage or export locks require it.
 - [ ] **Step 4: Run focused tests and full `npm test`; verify GREEN.** Add a stress fixture proving D1 physical size remains under 300 MiB and no cursor passes an unpersisted item under sustained overload.
 - [ ] **Step 5: Run typecheck/build; commit `feat: ingest feeds and store bounded full text`.**
 

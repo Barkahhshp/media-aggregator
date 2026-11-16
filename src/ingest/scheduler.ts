@@ -1,7 +1,7 @@
 import type { Env } from "../env";
 import { getSource } from "../sources/repository";
 import type { Source } from "../sources/types";
-import { discoverSource } from "./discovery";
+import { discoverHtmlList, discoverSource } from "./discovery";
 import { extractArticle } from "./html-extractor";
 import { fetchPendingDocument, fetchSourceDocument } from "./fetch-source";
 import { claimPending, enqueueCandidates, markPendingFailure, purgeExpiredTerminalItems } from "./pending-repository";
@@ -307,6 +307,9 @@ async function handleArticlePending(
       now,
       maxCandidates: DISCOVERY_NEW_CANDIDATE_LIMIT,
       maxChecks: DISCOVERY_CHECK_LIMIT,
+      pendingSitemapId: item.id,
+      pendingSitemapLeaseToken: item.lease_token ?? undefined,
+      pendingSitemapCursor: item.sitemap_cursor,
     });
     if (discovery.stopReason === "storage_limit") return { status: "storage_limit", errorCode: "storage_limit", httpStatus: response.status };
     if (discovery.stopReason !== null && discovery.stopReason !== "max_candidates" && discovery.stopReason !== "query_limit") {
@@ -395,7 +398,7 @@ async function handleSourceFetch(
       result.errorCode = "storage_limit";
     }
   };
-  if (source.kind === "article" || source.kind === "html_list") {
+  if (source.kind === "article") {
     const enqueued = await enqueueCandidates(db, source, [sourceCandidate(source)], {
       now,
       maxCandidates: 1,
@@ -463,11 +466,14 @@ async function handleSourceFetch(
 
   try {
     result.httpStatus = response.status;
-    const discovered = await discoverSource(db, source, response.body, response.headers.get("Content-Type") ?? "application/octet-stream", {
+    const discoveryBudget = {
       now,
       maxCandidates: DISCOVERY_NEW_CANDIDATE_LIMIT,
       maxChecks: DISCOVERY_CHECK_LIMIT,
-    });
+    };
+    const discovered = source.kind === "html_list"
+      ? await discoverHtmlList(db, source, response.body, discoveryBudget, response.url.href)
+      : await discoverSource(db, source, response.body, response.headers.get("Content-Type") ?? "application/octet-stream", discoveryBudget);
     result.discovered += discovered.inserted;
     if (discovered.stopReason === "storage_limit") {
       result.status = "storage_limit";
@@ -556,7 +562,8 @@ async function processPendingItem(
 export async function runScheduled(env: Env, scheduledTime: number): Promise<ScheduleResult> {
   const budget = withQueryBudget(env.DB);
   const db = budget.db;
-  const now = Math.floor(scheduledTime / 1000);
+  const scheduledAt = Math.floor(scheduledTime / 1000);
+  const now = Math.floor(Date.now() / 1000);
   const result = scheduleResult();
   const runId = crypto.randomUUID();
   let runReservation: WriteReservation | null = null;
@@ -606,7 +613,7 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
     await db.prepare(`
       INSERT INTO fetch_runs (id, started_at, status)
       VALUES (?, ?, 'running')
-    `).bind(runId, now).run();
+    `).bind(runId, scheduledAt).run();
     runStarted = true;
 
     const eligible = await db.prepare(`
@@ -711,7 +718,7 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
     }
     if (runStarted) {
       try {
-        await saveRunResult(db, runId, sourceIdForRun, result, now, Math.floor(Date.now() / 1000), runErrorMessage);
+        await saveRunResult(db, runId, sourceIdForRun, result, scheduledAt, Math.floor(Date.now() / 1000), runErrorMessage);
       } catch {
         result.status = result.status === "storage_limit" ? "storage_limit" : "failed";
         result.errorCode ??= "run_log_error";

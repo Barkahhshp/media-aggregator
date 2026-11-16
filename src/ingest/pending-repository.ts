@@ -25,7 +25,7 @@ const PENDING_HASH_PREFIX = "__cue_pending_sha256_v1__:";
 const OVERFLOW_URL_PREFIX = "https://metadata.invalid/sha256/";
 
 export interface PendingBudget {
-  /** Scheduler timestamp used to make newly discovered rows immediately eligible. */
+  /** Execution timestamp used to make newly discovered rows immediately eligible. */
   now?: number;
   /** Maximum number of new rows inserted by this call. Defaults to 10. */
   maxCandidates?: number;
@@ -35,6 +35,10 @@ export interface PendingBudget {
   maxTotalRows?: number;
   /** Total serialized metadata byte cap. Defaults to 24 MiB. */
   maxSerializedBytes?: number;
+  /** Pending sitemap row that owns this URL-set's cursor; source cursors remain for top-level discovery. */
+  pendingSitemapId?: string;
+  pendingSitemapLeaseToken?: string;
+  pendingSitemapCursor?: string | null;
 }
 
 export interface EnqueueResult {
@@ -62,6 +66,7 @@ export interface PendingItem {
   next_attempt_at: number;
   lease_token: string | null;
   lease_expires_at: number | null;
+  sitemap_cursor: string | null;
   last_error: string | null;
   terminal_expires_at: number | null;
   discovered_at: number;
@@ -96,6 +101,10 @@ interface PreparedCandidate {
 
 function bytes(value: string | null): number {
   return value === null ? 0 : new TextEncoder().encode(value).byteLength;
+}
+
+function jsonValueBytes(value: string | null): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 function hashIdentity(identity: string): string {
@@ -156,6 +165,7 @@ function prepareCandidate(source: Source, candidate: PendingCandidate, now: numb
     title: prepared.title,
     summary: prepared.summary,
     published_at: prepared.publishedAt,
+    sitemap_cursor: null,
     last_error: prepared.lastError,
   };
   return { ...prepared, serializedBytes: new TextEncoder().encode(JSON.stringify(metadata)).byteLength };
@@ -174,18 +184,62 @@ function truncateUtf8(value: string, maxBytes: number): string {
 }
 
 function cursorColumn(source: Source, cursor: SourceCursor): "feed_watermark" | "sitemap_last_loc" | null {
-  if (source.kind === "feed" && cursor.kind === "feed") return "feed_watermark";
+  if ((source.kind === "feed" || source.kind === "html_list") && cursor.kind === "feed") return "feed_watermark";
   if (source.kind === "sitemap" && cursor.kind === "sitemap") return "sitemap_last_loc";
   return null;
 }
 
-function cursorUpdateStatement(db: D1Database, source: Source, prepared: PreparedCandidate): D1PreparedStatement | null {
+function cursorUpdateStatement(
+  db: D1Database,
+  source: Source,
+  prepared: PreparedCandidate,
+  pendingSitemapId?: string,
+  pendingSitemapLeaseToken?: string,
+  now = Math.floor(Date.now() / 1000),
+  pendingSitemapCursor: string | null = null,
+  maxSerializedBytes = MAX_PENDING_METADATA_BYTES,
+): D1PreparedStatement | null {
   const cursor = prepared.candidate.sourceCursor;
   if (cursor === null) return null;
-  const column = cursorColumn(source, cursor);
+  const column = pendingSitemapId === undefined ? cursorColumn(source, cursor) : "sitemap_cursor";
   const expectedCursor = stableCursorValue(prepared.candidate.dedupeKey);
   if (column === null || bytes(expectedCursor) > MAX_SOURCE_CURSOR_BYTES || cursor.value !== expectedCursor) return null;
   const safeCursor = expectedCursor;
+  if (pendingSitemapId !== undefined) {
+    if (pendingSitemapLeaseToken === undefined) return null;
+    const cursorBytesDelta = jsonValueBytes(safeCursor) - jsonValueBytes(pendingSitemapCursor);
+    return db.prepare(`
+      UPDATE pending_items
+      SET sitemap_cursor = ?, updated_at = ?
+      WHERE id = ? AND item_type = 'sitemap' AND status = 'leased'
+        AND lease_token = ? AND lease_expires_at > ?
+        AND COALESCE((
+          SELECT SUM(length(CAST(json_object(
+            'source_id', source_id,
+            'dedupe_key', dedupe_key,
+            'external_id', external_id,
+            'canonical_url', canonical_url,
+            'title', title,
+            'summary', summary,
+            'published_at', published_at,
+            'sitemap_cursor', sitemap_cursor,
+            'last_error', last_error
+          ) AS BLOB))) FROM pending_items
+        ), 0) + ? <= ?
+        AND (
+          EXISTS (SELECT 1 FROM pending_items WHERE source_id = ? AND dedupe_key = ?)
+          OR EXISTS (
+            SELECT 1 FROM articles
+            WHERE source_id = ? AND ((? IS NOT NULL AND external_id = ?) OR canonical_url = ?)
+          )
+        )
+      RETURNING id
+    `).bind(
+      safeCursor, now, pendingSitemapId, pendingSitemapLeaseToken, now,
+      cursorBytesDelta, maxSerializedBytes,
+      source.id, prepared.dedupeKey, source.id, prepared.externalId, prepared.externalId, prepared.canonicalUrl,
+    );
+  }
   return db.prepare(
     `UPDATE sources
      SET ${column} = ?, updated_at = ?
@@ -201,7 +255,7 @@ function cursorUpdateStatement(db: D1Database, source: Source, prepared: Prepare
      RETURNING id`,
   ).bind(
     safeCursor,
-    Math.floor(Date.now() / 1000),
+    now,
     source.id,
     source.id,
     prepared.dedupeKey,
@@ -241,6 +295,7 @@ async function pendingStats(db: D1Database): Promise<{ count: number; bytes: num
       'title', title,
       'summary', summary,
       'published_at', published_at,
+      'sitemap_cursor', sitemap_cursor,
       'last_error', last_error
     ) AS BLOB))), 0) AS bytes
     FROM pending_items
@@ -289,14 +344,31 @@ export async function enqueueCandidates(
   }
 
   let latestSize = reservation.measuredSize;
+  let persistedChildCursor = budget.pendingSitemapCursor ?? null;
   try {
     for (let index = 0; index < candidatesToCheck; index += 1) {
       const candidate = candidates[index] as PendingCandidate;
       const prepared = prepareCandidate(source, candidate, now);
       const cursor = candidate.sourceCursor;
+      const nextChildCursor = budget.pendingSitemapId === undefined || cursor === null
+        ? null
+        : stableCursorValue(candidate.dedupeKey);
+      const childCursorBytesDelta = budget.pendingSitemapId === undefined || nextChildCursor === null
+        ? 0
+        : jsonValueBytes(nextChildCursor) - jsonValueBytes(persistedChildCursor);
+      const metadataGrowthBytes = prepared.serializedBytes + childCursorBytesDelta;
       const cursorUpdate = cursor === null && (source.kind === "article" || source.kind === "html_list")
         ? directCandidateAccountedStatement(db, prepared)
-        : cursorUpdateStatement(db, source, prepared);
+        : cursorUpdateStatement(
+          db,
+          source,
+          prepared,
+          budget.pendingSitemapId,
+          budget.pendingSitemapLeaseToken,
+          now,
+          persistedChildCursor,
+          maxBytes,
+        );
       if (cursorUpdate === null) {
         result.hasMore = true;
         result.stopReason = "invalid_cursor";
@@ -318,6 +390,7 @@ export async function enqueueCandidates(
             'title', title,
             'summary', summary,
             'published_at', published_at,
+            'sitemap_cursor', sitemap_cursor,
             'last_error', last_error
           ) AS BLOB)))
           FROM pending_items
@@ -347,7 +420,7 @@ export async function enqueueCandidates(
       prepared.lastError,
       prepared.terminalExpiresAt,
       maxTotalRows,
-      prepared.serializedBytes,
+      metadataGrowthBytes,
       maxBytes,
       result.inserted,
       maxNewRows,
@@ -366,12 +439,13 @@ export async function enqueueCandidates(
       const batch = await db.batch([insert, cursorUpdate]);
       latestSize = batch[1]?.meta.size_after ?? batch[0]?.meta.size_after ?? latestSize;
       const inserted = (batch[0]?.results?.length ?? 0) > 0;
-      const accounted = inserted || (batch[1]?.results?.length ?? 0) > 0;
+      const cursorUpdated = (batch[1]?.results?.length ?? 0) > 0;
+      const accounted = inserted || cursorUpdated;
       if (!inserted && !accounted) {
         const stats = await pendingStats(db);
         result.hasMore = true;
         if (stats.count >= maxTotalRows) result.stopReason = "pending_limit";
-        else if (stats.bytes + prepared.serializedBytes > maxBytes) result.stopReason = "metadata_limit";
+        else if (stats.bytes + metadataGrowthBytes > maxBytes) result.stopReason = "metadata_limit";
         else if (result.inserted >= maxNewRows) result.stopReason = "max_candidates";
         else result.stopReason = "invalid_cursor";
         break;
@@ -389,6 +463,7 @@ export async function enqueueCandidates(
       } else {
         result.deduplicated += 1;
       }
+      if (cursorUpdated && nextChildCursor !== null) persistedChildCursor = nextChildCursor;
       if (cursor !== null) result.lastAccountedCursor = { kind: cursor.kind, value: cursor.value };
       if (latestSize >= D1_STORAGE_STOP_BYTES) {
         result.stopReason = "storage_limit";

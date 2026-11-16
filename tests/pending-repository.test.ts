@@ -11,6 +11,9 @@ interface PendingBudget {
   maxChecks?: number;
   maxTotalRows?: number;
   maxSerializedBytes?: number;
+  pendingSitemapId?: string;
+  pendingSitemapLeaseToken?: string;
+  pendingSitemapCursor?: string | null;
 }
 
 interface EnqueueResult {
@@ -588,6 +591,172 @@ describe("durable pending repository", () => {
     expect(result.lastAccountedCursor).toBeNull();
     expect(await pendingRows()).toHaveLength(0);
     expect(await sourceLastStatus(source.id)).toBe("storage_limit");
+  });
+
+  it("does_not_exceed_the_metadata_cap_when_advancing_a_child_sitemap_cursor", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource("sitemap");
+    const now = Math.floor(Date.now() / 1000);
+    const childId = crypto.randomUUID();
+    const childLease = crypto.randomUUID();
+    const childUrl = "https://example.com/child.xml";
+    await testEnv.DB.prepare(`
+      INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, status, lease_token, lease_expires_at)
+      VALUES (?, ?, 'sitemap', ?, ?, 'leased', ?, ?)
+    `).bind(childId, source.id, childUrl, childUrl, childLease, now + 120).run();
+    const existing = await testEnv.DB.prepare(`
+      SELECT COALESCE(SUM(length(CAST(json_object(
+        'source_id', source_id, 'dedupe_key', dedupe_key, 'external_id', external_id,
+        'canonical_url', canonical_url, 'title', title, 'summary', summary,
+        'published_at', published_at, 'sitemap_cursor', sitemap_cursor, 'last_error', last_error
+      ) AS BLOB))), 0) AS bytes FROM pending_items
+    `).first<{ bytes: number }>();
+    const next = makeCandidate(42, { sourceCursor: { kind: "sitemap", value: "story-42" } });
+    const candidateBytes = new TextEncoder().encode(JSON.stringify({
+      source_id: source.id,
+      dedupe_key: next.dedupeKey,
+      external_id: next.externalId,
+      canonical_url: next.canonicalUrl,
+      title: next.title,
+      summary: next.summary,
+      published_at: next.publishedAt,
+      last_error: null,
+    })).byteLength;
+
+    const result = await repository.enqueueCandidates(testEnv.DB, source, [next], {
+      now,
+      maxSerializedBytes: (existing?.bytes ?? 0) + candidateBytes,
+      pendingSitemapId: childId,
+      pendingSitemapLeaseToken: childLease,
+      pendingSitemapCursor: null,
+    });
+
+    expect(result.inserted).toBe(0);
+    expect(result.stopReason).toBe("metadata_limit");
+    expect(result.lastAccountedCursor).toBeNull();
+    expect(await testEnv.DB.prepare("SELECT sitemap_cursor FROM pending_items WHERE id = ?").bind(childId).first())
+      .toMatchObject({ sitemap_cursor: null });
+    expect(await testEnv.DB.prepare("SELECT id FROM pending_items WHERE dedupe_key = ?").bind(next.dedupeKey).first()).toBeNull();
+  });
+
+  it("accounts_for_each_replacement_from_the_current_child_sitemap_cursor", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource("sitemap");
+    const now = Math.floor(Date.now() / 1000);
+    const childId = crypto.randomUUID();
+    const childLease = crypto.randomUUID();
+    const childUrl = "https://example.com/child.xml";
+    await testEnv.DB.prepare(`
+      INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, status, lease_token, lease_expires_at)
+      VALUES (?, ?, 'sitemap', ?, ?, 'leased', ?, ?)
+    `).bind(childId, source.id, childUrl, childUrl, childLease, now + 120).run();
+    const existing = await testEnv.DB.prepare(`
+      SELECT COALESCE(SUM(length(CAST(json_object(
+        'source_id', source_id, 'dedupe_key', dedupe_key, 'external_id', external_id,
+        'canonical_url', canonical_url, 'title', title, 'summary', summary,
+        'published_at', published_at, 'sitemap_cursor', sitemap_cursor, 'last_error', last_error
+      ) AS BLOB))), 0) AS bytes FROM pending_items
+    `).first<{ bytes: number }>();
+    const candidates = [
+      makeCandidate(1, { dedupeKey: "a", externalId: null, sourceCursor: { kind: "sitemap", value: "a" } }),
+      makeCandidate(2, {
+        dedupeKey: `b${"x".repeat(100)}`,
+        externalId: null,
+        sourceCursor: { kind: "sitemap", value: `b${"x".repeat(100)}` },
+      }),
+    ];
+    const serializedCandidateBytes = candidates.reduce((total, candidate) => total + new TextEncoder().encode(JSON.stringify({
+      source_id: source.id,
+      dedupe_key: candidate.dedupeKey,
+      external_id: candidate.externalId,
+      canonical_url: candidate.canonicalUrl,
+      title: candidate.title,
+      summary: candidate.summary,
+      published_at: candidate.publishedAt,
+      sitemap_cursor: null,
+      last_error: null,
+    })).byteLength, 0);
+    const finalCursorBytesDelta = new TextEncoder().encode(JSON.stringify(candidates[1]?.sourceCursor?.value)).byteLength
+      - new TextEncoder().encode(JSON.stringify(null)).byteLength;
+    const maxSerializedBytes = (existing?.bytes ?? 0) + serializedCandidateBytes + finalCursorBytesDelta;
+
+    const result = await repository.enqueueCandidates(testEnv.DB, source, candidates, {
+      now,
+      maxChecks: 2,
+      maxCandidates: 2,
+      maxSerializedBytes,
+      pendingSitemapId: childId,
+      pendingSitemapLeaseToken: childLease,
+      pendingSitemapCursor: null,
+    });
+    const after = await testEnv.DB.prepare(`
+      SELECT COALESCE(SUM(length(CAST(json_object(
+        'source_id', source_id, 'dedupe_key', dedupe_key, 'external_id', external_id,
+        'canonical_url', canonical_url, 'title', title, 'summary', summary,
+        'published_at', published_at, 'sitemap_cursor', sitemap_cursor, 'last_error', last_error
+      ) AS BLOB))), 0) AS bytes FROM pending_items
+    `).first<{ bytes: number }>();
+
+    expect(result.inserted).toBe(2);
+    expect(await testEnv.DB.prepare("SELECT sitemap_cursor FROM pending_items WHERE id = ?").bind(childId).first())
+      .toMatchObject({ sitemap_cursor: candidates[1]?.sourceCursor?.value });
+    expect(after?.bytes).toBeLessThanOrEqual(maxSerializedBytes);
+  });
+
+  it("holds_a_child_cursor_when_a_duplicate_advance_would_exceed_the_metadata_cap", async () => {
+    const repository = await loadRepository();
+    if (!repository) return;
+    const source = await makeSource("sitemap");
+    const now = Math.floor(Date.now() / 1000);
+    const childId = crypto.randomUUID();
+    const childLease = crypto.randomUUID();
+    const childUrl = "https://example.com/child.xml";
+    await testEnv.DB.prepare(`
+      INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, status, lease_token, lease_expires_at)
+      VALUES (?, ?, 'sitemap', ?, ?, 'leased', ?, ?)
+    `).bind(childId, source.id, childUrl, childUrl, childLease, now + 120).run();
+    const candidates = [
+      makeCandidate(1, { dedupeKey: "a", externalId: null, sourceCursor: { kind: "sitemap", value: "a" } }),
+      makeCandidate(2, {
+        dedupeKey: `b${"x".repeat(100)}`,
+        externalId: null,
+        sourceCursor: { kind: "sitemap", value: `b${"x".repeat(100)}` },
+      }),
+    ];
+    for (const [index, candidate] of candidates.entries()) {
+      await testEnv.DB.prepare(`
+        INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, title, status)
+        VALUES (?, ?, 'article', ?, ?, ?, 'pending')
+      `).bind(`already-${index}`, source.id, candidate.dedupeKey, candidate.canonicalUrl, candidate.title).run();
+    }
+    const current = await testEnv.DB.prepare(`
+      SELECT COALESCE(SUM(length(CAST(json_object(
+        'source_id', source_id, 'dedupe_key', dedupe_key, 'external_id', external_id,
+        'canonical_url', canonical_url, 'title', title, 'summary', summary,
+        'published_at', published_at, 'sitemap_cursor', sitemap_cursor, 'last_error', last_error
+      ) AS BLOB))), 0) AS bytes FROM pending_items
+    `).first<{ bytes: number }>();
+    const cursorGrowth = new TextEncoder().encode(JSON.stringify(candidates[1]?.sourceCursor?.value)).byteLength
+      - new TextEncoder().encode(JSON.stringify(null)).byteLength;
+    const maxSerializedBytes = (current?.bytes ?? 0) + cursorGrowth - 1;
+
+    const result = await repository.enqueueCandidates(testEnv.DB, source, candidates, {
+      now,
+      maxChecks: 2,
+      maxCandidates: 2,
+      maxSerializedBytes,
+      pendingSitemapId: childId,
+      pendingSitemapLeaseToken: childLease,
+      pendingSitemapCursor: null,
+    });
+    const cursor = await testEnv.DB.prepare("SELECT sitemap_cursor FROM pending_items WHERE id = ?").bind(childId).first<{ sitemap_cursor: string | null }>();
+
+    expect(result.deduplicated).toBe(1);
+    expect(result.stopReason).toBe("metadata_limit");
+    expect(result.lastAccountedCursor).toEqual({ kind: "sitemap", value: "a" });
+    expect(cursor?.sitemap_cursor).toBe("a");
   });
 
   it("stops_at_the_global_two_thousand_pending_row_cap", async () => {
