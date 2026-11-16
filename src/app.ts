@@ -3,6 +3,7 @@ import type { Env } from "./env";
 import { authenticateLocal } from "./auth/local-token";
 import { health } from "./routes/health";
 import { sources } from "./routes/sources";
+import { articles } from "./routes/articles";
 
 export function createApp(): Hono<{ Bindings: Env }> {
   const app = new Hono<{ Bindings: Env }>();
@@ -13,6 +14,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
   });
   app.route("/", health);
   app.route("/", sources);
+  app.route("/", articles);
   app.onError((_error, context) => {
     return context.json(
       {
