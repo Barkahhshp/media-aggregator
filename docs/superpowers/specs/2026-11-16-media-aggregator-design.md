@@ -78,8 +78,8 @@ Tabel `pending_items` menjadi backlog durable di D1. Minimal menyimpan `source_i
 Feed/sitemap diproses sebagai berikut:
 
 1. Ambil feed atau satu sitemap URL.
-2. Parse maksimum 100 kandidat, tetapi persist paling banyak 10 kandidat per invocation; sisanya tetap dapat ditemukan dari overlap/cursor pada polling berikutnya.
-3. Sebelum menyimpan, cek write gate D1, ukuran physical `meta.size_after`, kuota pending, dan ruang cadangan. Upsert paling banyak 10 kandidat per invocation ke `pending_items`. Cursor hanya maju sampai kandidat yang sukses tercatat; jika kapasitas tidak cukup, jangan majukan cursor melewati kandidat pertama yang belum tersimpan dan tandai sumber `storage_limit`.
+2. Parse feed dalam halaman maksimum 100 kandidat, dengan cursor opsional. Kembalikan `hasMore` untuk item setelah halaman dan `cursorFound`; jika cursor terakhir tidak lagi ada di feed saat ini, mulai lagi dari kandidat pertama dan andalkan dedupe.
+3. Sebelum menyimpan, cek write gate D1, ukuran physical `meta.size_after`, kuota pending, dan ruang cadangan. Upsert paling banyak 10 kandidat per invocation ke `pending_items`. Simpan cursor terakhir yang sukses dicatat, bukan cursor terakhir hasil parse; pada invocation berikutnya lanjutkan dari cursor tersimpan walaupun halaman parse sebelumnya masih memiliki kandidat tersisa. Jangan menghapus cursor hanya karena `hasMore` bernilai false; reset cursor ke awal hanya setelah parse dari cursor tersimpan mengembalikan nol kandidat. Cursor hanya maju sampai kandidat yang sukses tercatat; jika kapasitas tidak cukup, jangan majukan cursor melewati kandidat pertama yang belum tersimpan dan tandai sumber `storage_limit`.
 4. Pada invocation berikutnya, proses pending tertua. URL tetap pending sampai artikel berhasil diambil dan di-upsert atau kegagalan definitif dicatat; 403/404/unsupported page berstatus blocked/failed, bukan hilang.
 5. Sumber feed yang tidak punya pagination hanya dapat mengirim artikel yang masih ditampilkan penerbit. Jika satu feed berubah begitu cepat sampai item hilang sebelum polling berikutnya, sistem tidak dapat memulihkannya; catat batas ini.
 

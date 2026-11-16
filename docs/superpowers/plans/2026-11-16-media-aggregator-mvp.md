@@ -88,13 +88,13 @@
 **Interfaces:**
 - `normalizeAndValidateUrl(input: string, expectedHost?: string): URL` rejects non-HTTP(S), userinfo, non-80/443 ports, localhost/private/reserved/numeric-encoded hosts, and cross-host targets when `expectedHost` is supplied.
 - `fetchPublicUrl(url: URL, sourceHost: string, limits: FetchLimits): Promise<FetchResult>` uses `redirect: 'manual'`, validates each redirect, and caps 3 hops, 10-second timeout, and 2 MiB response bytes.
-- `parseFeed(body: string, contentType: string): ParsedFeed` supports RSS, Atom, JSON Feed and returns canonical provisional candidates.
+- `parseFeed(body: string, contentType: string, afterCursor?: SourceCursor): ParsedFeed` supports RSS, Atom and JSON Feed; returns at most 100 canonical provisional candidates after the cursor, plus `hasMore`, `cursorFound`, and the last returned `nextCursor` so later pages can be reached.
 - `parseSitemap(body: string): ParsedSitemap` supports urlsets and sitemap indexes with cursorable URLs.
 - `extractArticle(html: string, selectors: ArticleSelectors): ExtractedArticle` uses `HTMLRewriter` to extract configured title/summary/author/time/body.
 - `normalizePublishedAt(value: string | null | undefined): string | null` parses valid dates and serializes them as RFC3339 UTC text; invalid values return `null`. Task 5 article writes call this same helper.
-- Export `Candidate`, `SourceCursor`, `FetchLimits`, `FetchResult`, `ParsedFeed`, `ParsedSitemap`, and `ExtractedArticle` from `src/ingest/types.ts`; `Candidate` carries source ID, dedupe key, canonical URL, provisional metadata, and the source cursor that yielded it. Add `normalizePublishedAt` to `src/ingest/feed-parser.ts`.
+- Export `Candidate`, `SourceCursor`, `FetchLimits`, `FetchResult`, `ParsedFeed`, `ParsedSitemap`, and `ExtractedArticle` from `src/ingest/types.ts`; `ParsedFeed` includes `hasMore`, `cursorFound`, and `nextCursor`. `Candidate` carries source ID, dedupe key, canonical URL, provisional metadata, and the source cursor that yielded it. Add `normalizePublishedAt` to `src/ingest/feed-parser.ts`.
 
-- [ ] **Step 1: Write failing parser and URL tests** for normal/encoded/private URLs, multi-hop and cross-host redirects, oversized response, valid RSS/Atom/JSON Feed, >100 sitemap entries, sitemap index, missing HTML selector, normalized UTC timestamp, invalid timestamp → `null`, and >64-byte input.
+- [ ] **Step 1: Write failing parser and URL tests** for normal/encoded/private URLs, multi-hop and cross-host redirects, oversized response, valid RSS/Atom/JSON Feed, >100 feed entries paged through to the end, duplicate IDs and duplicate URLs spanning page boundaries, >100 sitemap entries, sitemap index, missing HTML selector, normalized UTC timestamp, invalid timestamp → `null`, and >64-byte input.
 - [ ] **Step 2: Run focused tests and verify RED.**
 - [ ] **Step 3: Implement URL validation, manual redirect fetch, bounded feed/sitemap parsers, and selector-based HTML extraction.** Disable XML entity expansion and reject parser payloads exceeding caps.
 - [ ] **Step 4: Run focused tests and full `npm test`; verify GREEN.**
@@ -107,13 +107,14 @@
 - Test: `tests/pending-repository.test.ts`, `tests/discovery.test.ts`
 
 **Interfaces:**
-- `enqueueCandidates(db: D1Database, source: Source, candidates: Candidate[], cursor: SourceCursor, budget: PendingBudget): Promise<EnqueueResult>` atomically persists no more than 10 rows, 2,000 total rows, or 24 MiB serialized pending metadata and returns the last safely persisted cursor.
+- `enqueueCandidates(db: D1Database, source: Source, candidates: Candidate[], budget: PendingBudget): Promise<EnqueueResult>` atomically persists no more than 10 rows, 2,000 total rows, or 24 MiB serialized pending metadata and returns the last safely accounted cursor (newly persisted or already present via dedupe).
 - `claimPending(db: D1Database, now: number, leaseToken: string): Promise<PendingItem | null>` claims the oldest eligible pending row.
 - `markPendingFailure(db: D1Database, item: PendingItem, outcome: PendingFailure): Promise<void>` records bounded retryable or terminal failure state without dropping a candidate.
+- `discoverSource` attaches the source ID, passes the last safely accounted feed cursor to `parseFeed`, stores candidates only from the same source host, and applies pending metadata byte caps before enqueue; if the saved cursor is absent, it restarts from the first page and relies on dedupe. If a valid cursor yields no candidates, reset the feed cursor to null for the next poll.
 
-- [ ] **Step 1: Write failing tests** for >10 candidates, full pending caps, cursor advancement only after persistence, no cursor advancement when the next candidate cannot fit, candidate overlap dedupe, and terminal-row expiry.
+- [ ] **Step 1: Write failing tests** for >10 candidates, >100 feed pagination through all retained items across 10-item storage invocations, missing-cursor restart/dedupe, feed cursor reset only after an empty page, cross-host feed URLs never enqueued, oversized metadata rejection, full pending caps, cursor advancement only after persist/dedupe, no cursor advancement when the next candidate cannot fit, candidate overlap dedupe, and terminal-row expiry.
 - [ ] **Step 2: Run focused tests and verify RED.**
-- [ ] **Step 3: Implement pending repository, per-field metadata byte caps, pending-cap accounting, durable cursor writes in the same D1 batch, and terminal-row cleanup.** Keep retryable rows; retain terminal `blocked/failed` rows for 30 days. Article completion remains Task 5's responsibility.
+- [ ] **Step 3: Implement pending repository and discovery, per-field metadata byte caps, same-host candidate validation, paginated feed cursor resume/reset, pending-cap accounting, durable cursor writes in the same D1 batch, and terminal-row cleanup.** Keep retryable rows; retain terminal `blocked/failed` rows for 30 days. Article completion remains Task 5's responsibility.
 - [ ] **Step 4: Run focused tests and full `npm test`; verify GREEN.**
 - [ ] **Step 5: Run typecheck/build; commit `feat: persist discovery backlog and cursors`.**
 
