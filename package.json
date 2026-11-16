@@ -8,12 +8,15 @@
     "build": "wrangler deploy --dry-run --outdir dist --env \"\""
   },
   "dependencies": {
-    "hono": "^4.13.18"
+    "hono": "^4.13.18",
+    "ipaddr.js": "^2.5.0",
+    "sax": "^1.6.1"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.2",
     "@cloudflare/workers-types": "^5.20261116.1",
     "@types/node": "^24.0.0",
+    "@types/sax": "^1.2.7",
     "typescript": "^5.8.3",
     "vitest": "^4.1.12",
     "wrangler": "^4.162.0"
