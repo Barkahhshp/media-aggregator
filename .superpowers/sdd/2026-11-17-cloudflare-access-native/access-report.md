@@ -182,7 +182,7 @@ Fix commit: `69be0202a60e41279f4d6ebd01fe67588584c0c6` — `fix: use authenticat
 
 ## Final verification after the identity fix
 
-On HEAD `ab30bb3` (code commits through `69be020`), the full checks were rerun after the fix:
+The full checks were rerun at `ab30bb3`, with code state through `69be020`. Subsequent commits `ab30bb3` and `8750025` were report-only, so no code changed after those checks. The reviewed HEAD is `8750025`.
 
 - `npm test` — PASS; 23 test files, 227 tests passed, exit 0.
 - `npm run lint` — PASS; `eslint .`, exit 0.
@@ -190,3 +190,17 @@ On HEAD `ab30bb3` (code commits through `69be020`), the full checks were rerun a
 - `npm run build` — PASS; Wrangler dry-run completed and exited 0; no deployment occurred.
 - `npm audit` — PASS; 0 vulnerabilities, exit 0.
 - `git diff --check` — PASS; exit 0.
+
+## Final review polish
+
+The final review polish made three clarification-only changes: corrected the test-side `authenticateLocal` declaration to `Promise<Response | null>` to match the async implementation; clarified that every production and preview Worker hostname, route, or domain intended to be protected must be covered by Worker-level Access; and corrected the final verification metadata to state that the full-suite checks ran at `ab30bb3`, with code state through `69be020`, while `ab30bb3` and `8750025` were report-only commits, so no code changed after those checks.
+
+Commands and outputs for this fix wave:
+
+```text
+npm test -- tests/auth.test.ts — PASS; 1 test file, 5 tests passed, exit 0.
+npm run typecheck — PASS; tsc --noEmit, exit 0.
+git diff --check — PASS; exit 0.
+```
+
+Fix-wave commit SHA: `45444bf` — `docs: polish native Access review findings`.

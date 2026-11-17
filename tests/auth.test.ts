@@ -8,7 +8,7 @@ interface AuthEnvironment {
 }
 
 interface LocalTokenModule {
-  authenticateLocal(request: Request, env: AuthEnvironment): Response | null;
+  authenticateLocal(request: Request, env: AuthEnvironment): Promise<Response | null>;
 }
 
 const authModules = import.meta.glob<LocalTokenModule>("../src/auth/local-token.ts");
