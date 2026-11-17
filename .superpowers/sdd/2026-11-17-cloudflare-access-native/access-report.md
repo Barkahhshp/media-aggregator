@@ -178,3 +178,15 @@ git diff --check
 Both commands exited 0. Affected files are `src/auth/local-token.ts`, `src/app.ts`, `tests/sources-api.test.ts`, and this report. The fix commit SHA is recorded after commit creation below.
 
 Fix commit: `69be0202a60e41279f4d6ebd01fe67588584c0c6` — `fix: use authenticated native identity for rate limiting`
+
+
+## Final verification after the identity fix
+
+On HEAD `ab30bb3` (code commits through `69be020`), the full checks were rerun after the fix:
+
+- `npm test` — PASS; 23 test files, 227 tests passed, exit 0.
+- `npm run lint` — PASS; `eslint .`, exit 0.
+- `npm run typecheck` — PASS; `tsc --noEmit`, exit 0.
+- `npm run build` — PASS; Wrangler dry-run completed and exited 0; no deployment occurred.
+- `npm audit` — PASS; 0 vulnerabilities, exit 0.
+- `git diff --check` — PASS; exit 0.
