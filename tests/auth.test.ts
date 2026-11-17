@@ -4,6 +4,7 @@ interface AuthEnvironment {
   DB: D1Database;
   APP_ENV: "test" | "local" | "production";
   API_TOKEN?: string;
+  ACCESS_AUD?: string;
 }
 
 interface LocalTokenModule {
@@ -33,7 +34,7 @@ describe("local authentication", () => {
     const authenticateLocal = await loadAuthenticateLocal();
     if (!authenticateLocal) return;
 
-    const response = authenticateLocal(new Request("https://api.example/v1/sources"), localEnv);
+    const response = await authenticateLocal(new Request("https://api.example/v1/sources"), localEnv);
 
     expect(response?.status).toBe(401);
     expect(await response?.json()).toMatchObject({
@@ -48,7 +49,7 @@ describe("local authentication", () => {
     const request = new Request("https://api.example/v1/sources", {
       headers: { Authorization: "Bearer wrong-token" },
     });
-    const response = authenticateLocal(request, localEnv);
+    const response = await authenticateLocal(request, localEnv);
 
     expect(response?.status).toBe(401);
     expect(await response?.text()).not.toContain(localEnv.API_TOKEN);
@@ -62,7 +63,7 @@ describe("local authentication", () => {
       headers: { Authorization: `Bearer ${localEnv.API_TOKEN}` },
     });
 
-    expect(authenticateLocal(request, localEnv)).toBeNull();
+    await expect(authenticateLocal(request, localEnv)).resolves.toBeNull();
   });
 
   it("does_not_use_API_TOKEN_as_a_production_access_fallback", async () => {
@@ -70,7 +71,7 @@ describe("local authentication", () => {
     if (!authenticateLocal) return;
 
     const productionEnv: AuthEnvironment = { ...localEnv, APP_ENV: "production" };
-    const response = authenticateLocal(
+    const response = await authenticateLocal(
       new Request("https://api.example/v1/sources", {
         headers: { Authorization: `Bearer ${localEnv.API_TOKEN}` },
       }),
@@ -80,15 +81,13 @@ describe("local authentication", () => {
     expect(response?.status).toBe(401);
   });
 
-  it("trusts_only_a_nonempty_cloudflare_access_assertion_in_production", async () => {
+  it("rejects_production_authentication_without_native_access_context", async () => {
     const authenticateLocal = await loadAuthenticateLocal();
     if (!authenticateLocal) return;
 
     const productionEnv: AuthEnvironment = { ...localEnv, APP_ENV: "production" };
-    const request = new Request("https://api.example/v1/sources", {
-      headers: { "Cf-Access-Jwt-Assertion": "signed-access-assertion" },
-    });
+    const request = new Request("https://api.example/v1/sources", { headers: { "Cf-Access-Jwt-Assertion": "signed-access-assertion" } });
 
-    expect(authenticateLocal(request, productionEnv)).toBeNull();
+    await expect(authenticateLocal(request, productionEnv)).resolves.not.toBeNull();
   });
 });

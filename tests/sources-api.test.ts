@@ -8,13 +8,21 @@ interface TestEnvironment {
   DB: D1Database;
   APP_ENV: "test" | "local" | "production";
   API_TOKEN: string;
+  ACCESS_AUD?: string;
   RATE_LIMITER: RateLimit;
   TEST_MIGRATIONS: D1Migration[];
 }
 
+interface AccessExecutionContext {
+  access: {
+    aud: string;
+    getIdentity(): Promise<Record<string, unknown> | undefined>;
+  };
+}
+
 interface SourcesAppModule {
   createApp(): {
-    request(input: string, init: RequestInit, env: TestEnvironment): Promise<Response> | Response;
+    request(input: string, init: RequestInit, env: TestEnvironment, executionCtx?: AccessExecutionContext): Promise<Response> | Response;
   };
 }
 
@@ -67,40 +75,80 @@ describe("source management API", () => {
     expect(response.status).toBe(401);
   });
 
-  it("rate_limits_each_authenticated_service_token_separately_without_exposing_its_identity", async () => {
+  it("authenticates_verified_service_tokens_and_rate_limits_each_identity_separately", async () => {
     const app = await loadApp();
     if (!app) return;
     const keys: string[] = [];
-    const counts = new Map<string, number>();
     const rateLimiter: RateLimit = {
       async limit({ key }) {
         keys.push(key);
-        const count = (counts.get(key) ?? 0) + 1;
-        counts.set(key, count);
-        return { success: count <= 1 };
+        return { success: true };
       },
     };
-    const productionEnv = { ...testEnv, APP_ENV: "production" as const, RATE_LIMITER: rateLimiter };
-    const accessToken = (commonName: string) => {
-      const payload = btoa(JSON.stringify({ common_name: commonName })).replace(/=/gu, "").replace(/\+/gu, "-").replace(/\//gu, "_");
-      return `header.${payload}.signature`;
+    const productionEnv = { ...testEnv, APP_ENV: "production" as const, ACCESS_AUD: "expected-aud", RATE_LIMITER: rateLimiter };
+    const serviceRequest = (serviceTokenId: string) => app.request("/v1/sources", {}, productionEnv, {
+      access: {
+        aud: "expected-aud",
+        getIdentity: async () => ({ service_token_id: serviceTokenId, service_token_status: true }),
+      },
+    });
+
+    expect((await serviceRequest("service-a.access")).status).toBe(200);
+    expect((await serviceRequest("service-b.access")).status).toBe(200);
+
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).not.toBe(keys[1]);
+    expect(keys.join(" ")).not.toContain("service-a.access");
+    expect(keys.join(" ")).not.toContain("service-b.access");
+  });
+
+  const rejectionCases: Array<{ name: string; headers: Record<string, string>; executionCtx?: AccessExecutionContext }> = [
+    { name: "no native context despite forged headers", headers: { Authorization: "Bearer forged", "Cf-Access-Jwt-Assertion": "forged.jwt.assertion" }, executionCtx: undefined },
+    { name: "missing audience", headers: {}, executionCtx: { access: { aud: "", getIdentity: async () => ({ service_token_id: "service-a.access", service_token_status: true }) } } },
+    { name: "wrong audience", headers: {}, executionCtx: { access: { aud: "wrong-aud", getIdentity: async () => ({ service_token_id: "service-a.access", service_token_status: true }) } } },
+    { name: "absent identity", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => undefined } } },
+    { name: "user identity without service token status", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => ({ email: "user@example.com", service_token_id: "service-a.access" }) } } },
+    { name: "missing service token ID", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => ({ service_token_status: true }) } } },
+    { name: "blank service token ID", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => ({ service_token_id: " ", service_token_status: true }) } } },
+    { name: "identity lookup throws", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => { throw new Error("identity lookup failed"); } } } },
+  ];
+
+  it.each(rejectionCases)("rejects $name before rate limiting without echoing auth material", async ({ headers, executionCtx }) => {
+    const app = await loadApp();
+    if (!app) return;
+    let limiterCalls = 0;
+    const productionEnv = {
+      ...testEnv,
+      APP_ENV: "production" as const,
+      ACCESS_AUD: "expected-aud",
+      RATE_LIMITER: { limit: async () => { limiterCalls += 1; return { success: true }; } },
     };
-    const serviceRequest = (commonName: string) => app.request("/v1/sources", {
-      headers: { "Cf-Access-Jwt-Assertion": accessToken(commonName) },
-    }, productionEnv);
+    const response = await app.request("/v1/sources", { headers }, productionEnv, executionCtx);
 
-    expect((await serviceRequest("token-one-client-id")).status).toBe(200);
-    const limited = await serviceRequest("token-one-client-id");
-    const separate = await serviceRequest("token-two-client-id");
+    expect(response.status).toBe(401);
+    expect(limiterCalls).toBe(0);
+    const body = await response.text();
+    expect(body).not.toContain("forged.jwt.assertion");
+    expect(body).not.toContain("service-a.access");
+  });
 
-    expect(limited.status).toBe(429);
-    expect(await limited.json()).toMatchObject({ error: { code: "rate_limit_exceeded" } });
-    expect(separate.status).toBe(200);
-    expect(keys).toHaveLength(3);
-    expect(keys[0]).toBe(keys[1]);
-    expect(keys[0]).not.toBe(keys[2]);
-    expect(keys.join(" ")).not.toContain("token-one-client-id");
-    expect(keys.join(" ")).not.toContain("token-two-client-id");
+  it("rejects_production_requests_when_ACCESS_AUD_is_missing", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    let limiterCalls = 0;
+    const response = await app.request("/v1/sources", {}, {
+      ...testEnv,
+      APP_ENV: "production" as const,
+      RATE_LIMITER: { limit: async () => { limiterCalls += 1; return { success: true }; } },
+    }, {
+      access: {
+        aud: "expected-aud",
+        getIdentity: async () => ({ service_token_id: "service-a.access", service_token_status: true }),
+      },
+    });
+
+    expect(response.status).toBe(401);
+    expect(limiterCalls).toBe(0);
   });
 
   it("creates_lists_updates_and_soft_disables_a_source", async () => {

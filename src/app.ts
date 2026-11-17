@@ -10,9 +10,15 @@ import { status } from "./routes/status";
 export function createApp(): Hono<{ Bindings: Env }> {
   const app = new Hono<{ Bindings: Env }>();
   app.use("/v1/*", async (context, next) => {
-    const rejection = authenticateLocal(context.req.raw, context.env);
+    let access: CloudflareAccessContext | undefined;
+    try {
+      access = (context.executionCtx as ExecutionContext & { access?: CloudflareAccessContext }).access;
+    } catch {
+      access = undefined;
+    }
+    const rejection = await authenticateLocal(context.req.raw, context.env, access);
     if (rejection !== null) return rejection;
-    const key = await rateLimitKey(context.req.raw, context.env);
+    const key = await rateLimitKey(context.req.raw, context.env, access);
     if (key === null) {
       return context.json({
         error: { code: "unauthorized", message: "Authentication required", request_id: context.req.header("X-Request-Id") ?? crypto.randomUUID() },
