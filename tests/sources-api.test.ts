@@ -102,6 +102,37 @@ describe("source management API", () => {
     expect(keys.join(" ")).not.toContain("service-b.access");
   });
 
+  it("uses_the_authenticated_native_identity_for_rate_limiting_without_a_second_lookup", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const keys: string[] = [];
+    let identityLookups = 0;
+    const rateLimiter: RateLimit = {
+      async limit({ key }) {
+        keys.push(key);
+        return { success: true };
+      },
+    };
+    const productionEnv = { ...testEnv, APP_ENV: "production" as const, ACCESS_AUD: "expected-aud", RATE_LIMITER: rateLimiter };
+    const response = await app.request("/v1/sources", {}, productionEnv, {
+      access: {
+        aud: "expected-aud",
+        getIdentity: async () => {
+          identityLookups += 1;
+          return identityLookups === 1
+            ? { service_token_id: "authenticated.access", service_token_status: true }
+            : { service_token_id: "different.access", service_token_status: true };
+        },
+      },
+    });
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("authenticated.access"));
+    const expectedHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+    expect(response.status).toBe(200);
+    expect(identityLookups).toBe(1);
+    expect(keys).toEqual([`production:${expectedHash}`]);
+  });
+
   const rejectionCases: Array<{ name: string; headers: Record<string, string>; executionCtx?: AccessExecutionContext }> = [
     { name: "no native context despite forged headers", headers: { Authorization: "Bearer forged", "Cf-Access-Jwt-Assertion": "forged.jwt.assertion" }, executionCtx: undefined },
     { name: "missing audience", headers: {}, executionCtx: { access: { aud: "", getIdentity: async () => ({ service_token_id: "service-a.access", service_token_status: true }) } } },

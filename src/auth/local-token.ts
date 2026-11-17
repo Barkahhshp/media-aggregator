@@ -35,7 +35,14 @@ async function identityForRequest(
 ): Promise<string | null> {
   if (env.APP_ENV === "production") return await accessServiceTokenIdentity(access, env);
   const match = request.headers.get("Authorization")?.match(/^Bearer\s+(\S+)$/i);
-  return match?.[1] ?? null;
+  const token = match?.[1];
+  return token !== undefined && token === env.API_TOKEN ? token : null;
+}
+
+async function rateLimitKeyForIdentity(env: Env, identity: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${env.APP_ENV}:${hex}`;
 }
 
 export async function rateLimitKey(
@@ -45,9 +52,17 @@ export async function rateLimitKey(
 ): Promise<string | null> {
   const identity = await identityForRequest(request, env, access);
   if (identity === null) return null;
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
-  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${env.APP_ENV}:${hex}`;
+  return await rateLimitKeyForIdentity(env, identity);
+}
+
+export async function authenticateWithRateLimitKey(
+  request: Request,
+  env: Env,
+  access?: CloudflareAccessContext,
+): Promise<Response | string> {
+  const identity = await identityForRequest(request, env, access);
+  if (identity === null) return unauthorized();
+  return await rateLimitKeyForIdentity(env, identity);
 }
 
 export async function authenticateLocal(
@@ -55,12 +70,6 @@ export async function authenticateLocal(
   env: Env,
   access?: CloudflareAccessContext,
 ): Promise<Response | null> {
-  if (env.APP_ENV === "production") {
-    return (await accessServiceTokenIdentity(access, env)) === null ? unauthorized() : null;
-  }
-
-  if (!env.API_TOKEN) return unauthorized();
-  const authorization = request.headers.get("Authorization");
-  const match = authorization?.match(/^Bearer\s+(\S+)$/i);
-  return match?.[1] === env.API_TOKEN ? null : unauthorized();
+  const result = await authenticateWithRateLimitKey(request, env, access);
+  return typeof result === "string" ? null : result;
 }

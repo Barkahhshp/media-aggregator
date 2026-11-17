@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { Env } from "./env";
-import { authenticateLocal, rateLimitKey } from "./auth/local-token";
+import { authenticateWithRateLimitKey } from "./auth/local-token";
 import { health } from "./routes/health";
 import { sources } from "./routes/sources";
 import { articles } from "./routes/articles";
@@ -16,16 +16,10 @@ export function createApp(): Hono<{ Bindings: Env }> {
     } catch {
       access = undefined;
     }
-    const rejection = await authenticateLocal(context.req.raw, context.env, access);
-    if (rejection !== null) return rejection;
-    const key = await rateLimitKey(context.req.raw, context.env, access);
-    if (key === null) {
-      return context.json({
-        error: { code: "unauthorized", message: "Authentication required", request_id: context.req.header("X-Request-Id") ?? crypto.randomUUID() },
-      }, 401);
-    }
+    const authenticated = await authenticateWithRateLimitKey(context.req.raw, context.env, access);
+    if (typeof authenticated !== "string") return authenticated;
     try {
-      const { success } = await context.env.RATE_LIMITER.limit({ key });
+      const { success } = await context.env.RATE_LIMITER.limit({ key: authenticated });
       if (!success) {
         return context.json({
           error: { code: "rate_limit_exceeded", message: "Request rate limit exceeded", request_id: context.req.header("X-Request-Id") ?? crypto.randomUUID() },
