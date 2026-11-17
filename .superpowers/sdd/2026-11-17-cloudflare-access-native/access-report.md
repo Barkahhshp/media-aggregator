@@ -203,4 +203,4 @@ npm run typecheck — PASS; tsc --noEmit, exit 0.
 git diff --check — PASS; exit 0.
 ```
 
-Fix-wave commit SHA: `45444bf` — `docs: polish native Access review findings`.
+Fix-wave commit SHA: `b416d20` — `docs: polish native Access review findings`.
