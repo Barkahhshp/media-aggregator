@@ -8,21 +8,13 @@ interface TestEnvironment {
   DB: D1Database;
   APP_ENV: "test" | "local" | "production";
   API_TOKEN: string;
-  ACCESS_AUD?: string;
   RATE_LIMITER: RateLimit;
   TEST_MIGRATIONS: D1Migration[];
 }
 
-interface AccessExecutionContext {
-  access: {
-    aud: string;
-    getIdentity(): Promise<Record<string, unknown> | undefined>;
-  };
-}
-
 interface SourcesAppModule {
   createApp(): {
-    request(input: string, init: RequestInit, env: TestEnvironment, executionCtx?: AccessExecutionContext): Promise<Response> | Response;
+    request(input: string, init: RequestInit, env: TestEnvironment): Promise<Response> | Response;
   };
 }
 
@@ -75,111 +67,15 @@ describe("source management API", () => {
     expect(response.status).toBe(401);
   });
 
-  it("authenticates_verified_service_tokens_and_rate_limits_each_identity_separately", async () => {
+  it("protects_health_and_v1_routes_in_production_with_the_configured_bearer_token", async () => {
     const app = await loadApp();
     if (!app) return;
-    const keys: string[] = [];
-    const rateLimiter: RateLimit = {
-      async limit({ key }) {
-        keys.push(key);
-        return { success: true };
-      },
-    };
-    const productionEnv = { ...testEnv, APP_ENV: "production" as const, ACCESS_AUD: "expected-aud", RATE_LIMITER: rateLimiter };
-    const serviceRequest = (serviceTokenId: string) => app.request("/v1/sources", {}, productionEnv, {
-      access: {
-        aud: "expected-aud",
-        getIdentity: async () => ({ service_token_id: serviceTokenId, service_token_status: true }),
-      },
-    });
-
-    expect((await serviceRequest("service-a.access")).status).toBe(200);
-    expect((await serviceRequest("service-b.access")).status).toBe(200);
-
-    expect(keys).toHaveLength(2);
-    expect(keys[0]).not.toBe(keys[1]);
-    expect(keys.join(" ")).not.toContain("service-a.access");
-    expect(keys.join(" ")).not.toContain("service-b.access");
-  });
-
-  it("uses_the_authenticated_native_identity_for_rate_limiting_without_a_second_lookup", async () => {
-    const app = await loadApp();
-    if (!app) return;
-    const keys: string[] = [];
-    let identityLookups = 0;
-    const rateLimiter: RateLimit = {
-      async limit({ key }) {
-        keys.push(key);
-        return { success: true };
-      },
-    };
-    const productionEnv = { ...testEnv, APP_ENV: "production" as const, ACCESS_AUD: "expected-aud", RATE_LIMITER: rateLimiter };
-    const response = await app.request("/v1/sources", {}, productionEnv, {
-      access: {
-        aud: "expected-aud",
-        getIdentity: async () => {
-          identityLookups += 1;
-          return identityLookups === 1
-            ? { service_token_id: "authenticated.access", service_token_status: true }
-            : { service_token_id: "different.access", service_token_status: true };
-        },
-      },
-    });
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("authenticated.access"));
-    const expectedHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-
-    expect(response.status).toBe(200);
-    expect(identityLookups).toBe(1);
-    expect(keys).toEqual([`production:${expectedHash}`]);
-  });
-
-  const rejectionCases: Array<{ name: string; headers: Record<string, string>; executionCtx?: AccessExecutionContext }> = [
-    { name: "no native context despite forged headers", headers: { Authorization: "Bearer forged", "Cf-Access-Jwt-Assertion": "forged.jwt.assertion" }, executionCtx: undefined },
-    { name: "missing audience", headers: {}, executionCtx: { access: { aud: "", getIdentity: async () => ({ service_token_id: "service-a.access", service_token_status: true }) } } },
-    { name: "wrong audience", headers: {}, executionCtx: { access: { aud: "wrong-aud", getIdentity: async () => ({ service_token_id: "service-a.access", service_token_status: true }) } } },
-    { name: "absent identity", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => undefined } } },
-    { name: "user identity without service token status", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => ({ email: "user@example.com", service_token_id: "service-a.access" }) } } },
-    { name: "missing service token ID", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => ({ service_token_status: true }) } } },
-    { name: "blank service token ID", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => ({ service_token_id: " ", service_token_status: true }) } } },
-    { name: "identity lookup throws", headers: {}, executionCtx: { access: { aud: "expected-aud", getIdentity: async () => { throw new Error("identity lookup failed"); } } } },
-  ];
-
-  it.each(rejectionCases)("rejects $name before rate limiting without echoing auth material", async ({ headers, executionCtx }) => {
-    const app = await loadApp();
-    if (!app) return;
-    let limiterCalls = 0;
-    const productionEnv = {
-      ...testEnv,
-      APP_ENV: "production" as const,
-      ACCESS_AUD: "expected-aud",
-      RATE_LIMITER: { limit: async () => { limiterCalls += 1; return { success: true }; } },
-    };
-    const response = await app.request("/v1/sources", { headers }, productionEnv, executionCtx);
-
-    expect(response.status).toBe(401);
-    expect(limiterCalls).toBe(0);
-    const body = await response.text();
-    expect(body).not.toContain("forged.jwt.assertion");
-    expect(body).not.toContain("service-a.access");
-  });
-
-  it("rejects_production_requests_when_ACCESS_AUD_is_missing", async () => {
-    const app = await loadApp();
-    if (!app) return;
-    let limiterCalls = 0;
-    const response = await app.request("/v1/sources", {}, {
-      ...testEnv,
-      APP_ENV: "production" as const,
-      RATE_LIMITER: { limit: async () => { limiterCalls += 1; return { success: true }; } },
-    }, {
-      access: {
-        aud: "expected-aud",
-        getIdentity: async () => ({ service_token_id: "service-a.access", service_token_status: true }),
-      },
-    });
-
-    expect(response.status).toBe(401);
-    expect(limiterCalls).toBe(0);
+    const productionEnv = { ...testEnv, APP_ENV: "production" as const };
+    expect((await app.request("/health", {}, productionEnv)).status).toBe(401);
+    expect((await app.request("/v1/sources", {}, productionEnv)).status).toBe(401);
+    const headers = { Authorization: `Bearer ${testEnv.API_TOKEN}` };
+    expect((await app.request("/health", { headers }, productionEnv)).status).toBe(200);
+    expect((await app.request("/v1/sources", { headers }, productionEnv)).status).toBe(200);
   });
 
   it("creates_lists_updates_and_soft_disables_a_source", async () => {

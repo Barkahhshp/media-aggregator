@@ -9,14 +9,14 @@ import { status } from "./routes/status";
 
 export function createApp(): Hono<{ Bindings: Env }> {
   const app = new Hono<{ Bindings: Env }>();
+  app.use("/health", async (context, next) => {
+    if (context.env.APP_ENV !== "production") return await next();
+    const authenticated = await authenticateWithRateLimitKey(context.req.raw, context.env);
+    if (typeof authenticated !== "string") return authenticated;
+    await next();
+  });
   app.use("/v1/*", async (context, next) => {
-    let access: CloudflareAccessContext | undefined;
-    try {
-      access = (context.executionCtx as ExecutionContext & { access?: CloudflareAccessContext }).access;
-    } catch {
-      access = undefined;
-    }
-    const authenticated = await authenticateWithRateLimitKey(context.req.raw, context.env, access);
+    const authenticated = await authenticateWithRateLimitKey(context.req.raw, context.env);
     if (typeof authenticated !== "string") return authenticated;
     try {
       const { success } = await context.env.RATE_LIMITER.limit({ key: authenticated });
