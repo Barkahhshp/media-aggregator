@@ -44,14 +44,13 @@ This overwrites the database at the selected point in time and cancels in-flight
 
 An export is a stable snapshot. Starting one waits until an active ingestion lease has finished, takes the existing `system_state.export_lock` for up to 30 minutes, and blocks scheduler and source changes until `endExport` releases it. Every page repeats a schema-versioned manifest and contains at most 10 NDJSON lines total (manifest included) and 3 MiB of UTF-8 output. Full article text is encoded as base64 UTF-8 so one maximum-size article remains representable; the restore tool decodes it and verifies its SHA-256 content hash. The manifest reports the stable snapshot ID, export watermark, row counts, and next cursor. Page through the cursor in order, keep the file private, and always end the session when finished. If the lock expires, start a fresh export rather than mixing pages from different snapshots.
 
-Example machine export (requires `curl` and `jq`; keep the Access credentials in environment variables):
+Example machine export (requires `curl` and `jq`; keep `API_TOKEN` in the environment without printing it):
 
 ```bash
 set -euo pipefail
 umask 077
 BASE_URL="https://api.example.com"
-HEADERS=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
-         -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
+HEADERS=(-H "Authorization: Bearer $API_TOKEN")
 BACKUP="media-aggregator-$(date -u +%Y%m%dT%H%M%SZ).ndjson"
 if [ -e "$BACKUP" ]; then
   printf 'Refusing to overwrite existing backup %s\n' "$BACKUP" >&2

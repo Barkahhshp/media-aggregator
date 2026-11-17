@@ -34,3 +34,24 @@ Only the requested implementation, tests, documentation, and this report are sta
 ## Remaining operational action
 
 An authorized operator must configure the Worker secret `API_TOKEN` through the deployment workflow and deploy separately. This task intentionally does not perform that external side effect.
+
+## Review fix
+
+Rewrote the portable export example to use environment variable `API_TOKEN` and `Authorization: Bearer $API_TOKEN` through the shared headers array for every request, including cleanup; removed the obsolete caller instructions.
+
+Checks run and actual output:
+
+```text
+$ grep -F 'Authorization: Bearer $API_TOKEN' docs/operations.md
+HEADERS=(-H "Authorization: Bearer $API_TOKEN")
+$ grep -nE 'CF-Access|CF_ACCESS|Access credentials|ACCESS_AUD|JWT' docs/operations.md
+(no matches)
+$ grep -n 'curl' docs/operations.md
+47:Example machine export (requires `curl` and `jq`; keep `API_TOKEN` in the environment without printing it):
+64:    curl -fsS -X DELETE "${HEADERS[@]}" "$BASE_URL/v1/exports/$EXPORT_ID" >/dev/null || true
+72:SESSION=$(curl -fsS -X POST "${HEADERS[@]}" "$BASE_URL/v1/exports")
+77:    curl -fsS "${HEADERS[@]}" "$BASE_URL/v1/exports/$EXPORT_ID" -o "$PAGE"
+79:    curl -fsS -G "${HEADERS[@]}" "$BASE_URL/v1/exports/$EXPORT_ID" \
+      --data-urlencode "cursor=$CURSOR" -o "$PAGE"
+$ git diff --check
+```
