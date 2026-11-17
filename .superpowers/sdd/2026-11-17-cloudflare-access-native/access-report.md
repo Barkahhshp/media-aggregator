@@ -116,4 +116,65 @@ The pre-existing coordinator-only modification `.superpowers/sdd/2026-11-16-medi
 
 ## Concerns and review state
 
-No Cloudflare account/resource/policy/token/secret changes were made, and nothing was deployed or pushed. The task brief requests sending the commit and report to a fresh independent reviewer before any push; no independent reviewer was available in this execution context, so the commit is intentionally not pushed. The implementation was self-reviewed with `git diff`, `git diff --check`, and the complete verification suite; parent/coordinator review remains required before any future push.
+No Cloudflare account/resource/policy/token/secret changes were made, and nothing was deployed or pushed. A fresh independent reviewer reviewed commit `52efda8` and raised the native identity double-lookup finding addressed below. The scoped fix remains unpushed; parent/coordinator review remains required before any future push.
+
+## Independent review and fix round 1
+
+The fresh independent review found that production middleware called native `getIdentity()` once during `authenticateLocal(...)` and again during `rateLimitKey(...)`. This could authorize one service-token identity while rate-limiting another, or authorize successfully and fail during key derivation, and duplicated a platform lookup. The fix performs authentication and SHA-256 key derivation in one helper, passes only the resulting hash to `RATE_LIMITER.limit`, and preserves local Bearer validation behavior. The regression uses a real Hono request whose first lookup returns `authenticated.access` and second lookup would return `different.access`; it asserts one lookup and the first identity's hash.
+
+### RED
+
+Exact command:
+
+```text
+npm test -- tests/sources-api.test.ts -t uses_the_authenticated_native_identity_for_rate_limiting_without_a_second_lookup
+```
+
+Relevant exact output:
+
+```text
+FAIL tests/sources-api.test.ts > source management API > uses_the_authenticated_native_identity_for_rate_limiting_without_a_second_lookup
+AssertionError: expected 2 to be 1 // Object.is equality
+Tests  1 failed | 28 skipped (29)
+```
+
+### GREEN
+
+Exact focused command:
+
+```text
+npm test -- tests/sources-api.test.ts -t uses_the_authenticated_native_identity_for_rate_limiting_without_a_second_lookup
+```
+
+Exact result:
+
+```text
+Test Files  1 passed (1)
+Tests       1 passed | 28 skipped (29)
+```
+
+Relevant auth/API verification command:
+
+```text
+npm test -- tests/auth.test.ts tests/sources-api.test.ts
+```
+
+Exact result:
+
+```text
+Test Files  2 passed (2)
+Tests       34 passed (34)
+```
+
+Additional verification:
+
+```text
+npm run typecheck
+> tsc --noEmit
+
+git diff --check
+```
+
+Both commands exited 0. Affected files are `src/auth/local-token.ts`, `src/app.ts`, `tests/sources-api.test.ts`, and this report. The fix commit SHA is recorded after commit creation below.
+
+Fix commit: `69be0202a60e41279f4d6ebd01fe67588584c0c6` — `fix: use authenticated native identity for rate limiting`
