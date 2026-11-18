@@ -7,6 +7,11 @@ import { articles } from "./routes/articles";
 import { exports } from "./routes/exports";
 import { status } from "./routes/status";
 
+function withNoStore(response: Response): Response {
+  response.headers.set("Cache-Control", "no-store");
+  return response;
+}
+
 export function createApp(): Hono<{ Bindings: Env }> {
   const app = new Hono<{ Bindings: Env }>();
   app.use("/health", async (context, next) => {
@@ -16,21 +21,23 @@ export function createApp(): Hono<{ Bindings: Env }> {
     await next();
   });
   app.use("/v1/*", async (context, next) => {
+    context.header("Cache-Control", "no-store");
     const authenticated = await authenticateWithRateLimitKey(context.req.raw, context.env);
-    if (typeof authenticated !== "string") return authenticated;
+    if (typeof authenticated !== "string") return withNoStore(authenticated);
     try {
       const { success } = await context.env.RATE_LIMITER.limit({ key: authenticated });
       if (!success) {
-        return context.json({
+        return withNoStore(context.json({
           error: { code: "rate_limit_exceeded", message: "Request rate limit exceeded", request_id: context.req.header("X-Request-Id") ?? crypto.randomUUID() },
-        }, 429);
+        }, 429));
       }
     } catch {
-      return context.json({
+      return withNoStore(context.json({
         error: { code: "rate_limiter_unavailable", message: "Request could not be processed", request_id: context.req.header("X-Request-Id") ?? crypto.randomUUID() },
-      }, 503);
+      }, 503));
     }
     await next();
+    return withNoStore(context.res);
   });
   app.route("/", health);
   app.route("/", sources);
@@ -38,7 +45,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
   app.route("/", exports);
   app.route("/", status);
   app.onError((_error, context) => {
-    return context.json(
+    const response = context.json(
       {
         error: {
           code: "internal_error",
@@ -48,6 +55,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
       },
       500,
     );
+    return /^\/v1(?:\/|$)/.test(context.req.path) ? withNoStore(response) : response;
   });
   return app;
 }
