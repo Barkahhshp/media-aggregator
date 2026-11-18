@@ -1,10 +1,38 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { useAuth } from "./auth/AuthProvider";
+import { OverviewPage } from "./pages/OverviewPage";
+import { SourcesPage } from "./pages/SourcesPage";
+
+function currentLocation(): string {
+  return `${window.location.pathname}${window.location.search}`;
+}
+
+function routeName(path: string): string {
+  const pathname = new URL(path, window.location.origin).pathname;
+  if (pathname === "/runs") return "Runs";
+  if (pathname === "/errors") return "Errors";
+  if (pathname === "/pending") return "Pending items";
+  if (pathname === "/articles") return "Articles and feed";
+  if (pathname === "/exports") return "Exports and backups";
+  return "Dashboard view";
+}
 
 export function App() {
-  const { token, login, logout } = useAuth();
+  const { token, session, login, logout } = useAuth();
   const [draftToken, setDraftToken] = useState("");
+  const [location, setLocation] = useState(currentLocation);
+
+  const navigate = useCallback((path: string) => {
+    window.history.pushState(null, "", path);
+    setLocation(currentLocation());
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => setLocation(currentLocation());
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
 
   const submitToken = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -38,6 +66,10 @@ export function App() {
     );
   }
 
+  const pathname = new URL(location, window.location.origin).pathname;
+  const isOverview = pathname === "/" || pathname === "/overview";
+  const isSources = pathname === "/sources";
+
   return (
     <main className="dashboard-shell">
       <header className="topbar">
@@ -45,13 +77,27 @@ export function App() {
           <p className="eyebrow">Private operations</p>
           <h1>Media Aggregator</h1>
         </div>
-        <button className="secondary-button" type="button" onClick={logout}>Log out</button>
+        <div className="topbar-actions">
+          <p className="status-dot">Signed in</p>
+          <button className="secondary-button" type="button" onClick={logout}>Log out</button>
+        </div>
       </header>
-      <section className="welcome-card" aria-live="polite">
-        <p className="status-dot">Signed in</p>
-        <h2>Dashboard workspace is ready</h2>
-        <p>Operational views will appear here. Your session is held only in this tab.</p>
-      </section>
+      <nav className="primary-nav" aria-label="Main navigation">
+        <a href="/overview" aria-current={isOverview ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/overview"); }}>Overview</a>
+        <a href="/sources" aria-current={isSources ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/sources"); }}>Sources</a>
+      </nav>
+      {isOverview ? (
+        <OverviewPage session={session} onNavigate={navigate} />
+      ) : isSources ? (
+        <SourcesPage session={session} onNavigate={navigate} />
+      ) : (
+        <section className="future-view empty-state" aria-live="polite">
+          <p className="eyebrow">Filtered view</p>
+          <h2>{routeName(location)}</h2>
+          <p>This filter will open when its dashboard screen is available. Your Overview and Sources screens are ready.</p>
+          <a href="/overview" onClick={(event) => { event.preventDefault(); navigate("/overview"); }}>Back to Overview</a>
+        </section>
+      )}
     </main>
   );
 }
