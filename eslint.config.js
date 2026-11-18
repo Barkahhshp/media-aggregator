@@ -3,11 +3,11 @@ import globals from "globals";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist/**", ".wrangler/**", "node_modules/**", ".superpowers/**"] },
+  { ignores: ["dist/**", "dashboard/dist/**", ".wrangler/**", "node_modules/**", ".superpowers/**"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    files: ["**/*.{js,mjs,cjs,ts}"],
+    files: ["**/*.{js,mjs,cjs,ts,tsx}"],
     languageOptions: {
       globals: {
         ...globals.browser,
@@ -17,11 +17,12 @@ export default tseslint.config(
         D1Migration: "readonly",
         D1Result: "readonly",
         ExecutionContext: "readonly",
+        Fetcher: "readonly",
       },
     },
   },
   {
-    files: ["**/*.ts"],
+    files: ["**/*.{ts,tsx}"],
     rules: {
       "no-undef": "off",
       "@typescript-eslint/no-unused-vars": [
