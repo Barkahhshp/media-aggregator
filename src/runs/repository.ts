@@ -54,7 +54,7 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return result;
 }
 
-function sanitizeErrorCode(value: string | null): string | null {
+export function sanitizeErrorCode(value: string | null): string | null {
   if (value === null) return null;
   const code = value.trim().toLowerCase();
   if (/^[a-z][a-z0-9_.-]{0,127}$/u.test(code) && byteLength(code) <= MAX_ERROR_CODE_BYTES) return code;
@@ -70,7 +70,7 @@ function replaceControlCharacters(value: string): string {
   return result;
 }
 
-function sanitizeErrorMessage(value: string | null): string | null {
+export function sanitizeErrorMessage(value: string | null): string | null {
   if (value === null) return null;
   const sanitized = replaceControlCharacters(value)
     .replace(/https?:\/\/[^\s"'<>]+/giu, "[redacted-url]")

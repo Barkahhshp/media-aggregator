@@ -142,9 +142,45 @@ describe("run history API", () => {
     expect((await runRequest(app, "/v1/runs?status=unknown")).status).toBe(400);
     const source = await runRequest(app, "/v1/runs?source_id=historical-source");
     expect((await source.json<{ runs: Array<{ id: string }> }>()).runs.map((run) => run.id)).toEqual(["run-legacy-trap"]);
-    const sourcePlan = await testEnv.DB.prepare(`EXPLAIN QUERY PLAN SELECT run_id FROM fetch_run_sources
-      WHERE source_id_snapshot = ? AND run_id IN ('run-new', 'run-legacy-trap')`).bind("historical-source").all<{ detail: string }>();
+    const sourcePlan = await testEnv.DB.prepare(`EXPLAIN QUERY PLAN SELECT id, source_id, started_at, finished_at, status, http_status, discovered_count, stored_count, error_code, error_message
+      FROM fetch_runs
+      WHERE started_at >= ?
+        AND EXISTS (SELECT 1 FROM fetch_run_sources AS source_filter INDEXED BY idx_fetch_run_sources_source_run
+          WHERE source_filter.run_id = fetch_runs.id AND source_filter.source_id_snapshot = ?)
+      ORDER BY started_at DESC, id DESC LIMIT ?`).bind(now - 30 * 86400, "historical-source", 50).all<{ detail: string }>();
     expect(sourcePlan.results.map((row) => row.detail).join(" ")).toContain("idx_fetch_run_sources_source_run");
+  });
+
+  it("sanitizes and bounds legacy error fields on both list and detail reads", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const malformedMessage = `${"x".repeat(1010)}\nhttps://secret.example/path Bearer top-secret token=abc@example.com`;
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(`INSERT INTO fetch_runs (id, source_id, started_at, finished_at, status, error_code, error_message)
+        VALUES ('run-malformed-errors', 'source-a', ?, ?, 'failed', ' BAD CODE ', ?)`)
+        .bind(now - 400, now - 300, malformedMessage.slice(0, 1024)),
+      testEnv.DB.prepare(`INSERT INTO fetch_run_sources (run_id, source_id_snapshot, source_id, status, error_code, error_message)
+        VALUES ('run-malformed-errors', 'source-a', 'source-a', 'failed', ' BAD SOURCE CODE ', ?)`)
+        .bind(malformedMessage.slice(0, 1024)),
+    ]);
+
+    const list = await runRequest(app, "/v1/runs");
+    const listed = (await list.json<{ runs: Array<{ id: string; error_code: string | null; error_message: string | null }> }>()).runs
+      .find((run) => run.id === "run-malformed-errors");
+    expect(listed).toMatchObject({ id: "run-malformed-errors", error_code: "unknown_error" });
+    expect(listed?.error_message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    expect(listed?.error_message).not.toContain("https://");
+    expect(listed?.error_message).not.toContain("Bearer top-secret");
+    expect(listed?.error_message).toHaveLength(1024);
+
+    const detail = await runRequest(app, "/v1/runs/run-malformed-errors");
+    const detailPayload = await detail.json<{ run: { error_code: string | null; error_message: string | null }; sources: Array<{ error_code: string | null; error_message: string | null }> }>();
+    expect(detailPayload.run.error_code).toBe("unknown_error");
+    expect(detailPayload.run.error_message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    expect(detailPayload.run.error_message).toHaveLength(1024);
+    expect(detailPayload.sources[0]?.error_code).toBe("unknown_error");
+    expect(detailPayload.sources[0]?.error_message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    expect(detailPayload.sources[0]?.error_message).toHaveLength(1024);
   });
 
   it("returns run-global detail, computed live/finished durations, and source summaries", async () => {

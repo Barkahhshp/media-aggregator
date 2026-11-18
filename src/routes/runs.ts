@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { Env } from "../env";
-import { decodeRunCursor, encodeRunCursor, InvalidRunCursorError, RUN_STATUSES } from "../runs/repository";
+import { decodeRunCursor, encodeRunCursor, InvalidRunCursorError, RUN_STATUSES, sanitizeErrorCode, sanitizeErrorMessage } from "../runs/repository";
 
 interface RunRow {
   id: string;
@@ -48,6 +48,10 @@ function durationSeconds(row: RunRow, now: number): number {
   return Math.max(0, (row.finished_at ?? now) - row.started_at);
 }
 
+function sanitizeErrorFields<T extends { error_code: string | null; error_message: string | null }>(row: T): T {
+  return { ...row, error_code: sanitizeErrorCode(row.error_code), error_message: sanitizeErrorMessage(row.error_message) };
+}
+
 runs.get("/v1/runs", async (context) => {
   const limit = parseLimit(context);
   if (limit instanceof Response) return limit;
@@ -67,7 +71,7 @@ runs.get("/v1/runs", async (context) => {
   const predicates = ["started_at >= ?"];
   if (status !== undefined) { predicates.push("status = ?"); bindings.push(status); }
   if (sourceId !== undefined) {
-    predicates.push("EXISTS (SELECT 1 FROM fetch_run_sources AS source_filter WHERE source_filter.run_id = fetch_runs.id AND source_filter.source_id_snapshot = ?)");
+    predicates.push("EXISTS (SELECT 1 FROM fetch_run_sources AS source_filter INDEXED BY idx_fetch_run_sources_source_run WHERE source_filter.run_id = fetch_runs.id AND source_filter.source_id_snapshot = ?)");
     bindings.push(sourceId);
   }
   if (cursor !== undefined) {
@@ -79,7 +83,7 @@ runs.get("/v1/runs", async (context) => {
   const rows = result.results;
   const next = rows.length === limit ? rows[rows.length - 1] : undefined;
   return context.json({
-    runs: rows.map((row) => ({ ...row, duration_seconds: durationSeconds(row, now) })),
+    runs: rows.map((row) => ({ ...sanitizeErrorFields(row), duration_seconds: durationSeconds(row, now) })),
     next_cursor: next ? encodeRunCursor({ startedAt: Number(next.started_at), id: next.id }) : null,
   });
 });
@@ -90,5 +94,5 @@ runs.get("/v1/runs/:id", async (context) => {
   if (row === null) return context.json({ error: { code: "run_not_found", message: "Run not found", request_id: context.req.header("X-Request-Id") ?? crypto.randomUUID() } }, 404);
   const sources = await context.env.DB.prepare("SELECT source_id_snapshot, status, http_status, discovered_count, stored_count, error_code, error_message FROM fetch_run_sources WHERE run_id = ? ORDER BY source_id_snapshot ASC").bind(id).all<SourceRow>();
   const now = Math.floor(Date.now() / 1000);
-  return context.json({ run: { ...row, duration_seconds: durationSeconds(row, now) }, sources: sources.results });
+  return context.json({ run: { ...sanitizeErrorFields(row), duration_seconds: durationSeconds(row, now) }, sources: sources.results.map(sanitizeErrorFields) });
 });
