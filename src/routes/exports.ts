@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
-import { endExport, ExportRepositoryError, getExportPage, getExportSession, startExport } from "../exports/repository";
+import { endExport, ExportRepositoryError, getActiveExportSession, getExportPage, getExportSession, startExport } from "../exports/repository";
 import type { ExportSession } from "../exports/repository";
 
 export const exports = new Hono<{ Bindings: Env }>();
@@ -44,6 +44,19 @@ exports.post("/v1/exports", async (context) => {
   }
 });
 
+exports.get("/v1/exports/active", async (context) => {
+  const session = await getActiveExportSession(context.env.DB);
+  return context.json({
+    session: session === null ? null : {
+      id: session.id,
+      snapshot_id: session.snapshot_id,
+      counts: session.counts,
+      expires_at: session.expires_at,
+      cursor: session.cursor,
+    },
+  }, 200, { "Cache-Control": "no-store" });
+});
+
 exports.get("/v1/exports/:id", async (context) => {
   const session = await getExportSession(context.env.DB, context.req.param("id"));
   if (session === null) {
@@ -72,7 +85,8 @@ exports.delete("/v1/exports/:id", async (context) => {
     return errorResponse(404, "export_not_found", "The export session was not found", context.req.raw);
   }
   try {
-    await endExport(context.env.DB, id);
+    const ended = await endExport(context.env.DB, id);
+    if (!ended) return errorResponse(410, "export_expired", "The export session is no longer active", context.req.raw);
     return context.json({ status: "ended", session_id: id }, 200, { "Cache-Control": "no-store" });
   } catch (error) {
     return repositoryError(error, context.req.raw);

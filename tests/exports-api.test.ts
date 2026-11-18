@@ -45,6 +45,14 @@ interface ExportManifest {
   next_cursor: string | null;
 }
 
+interface ActiveExportRecovery {
+  id: string;
+  snapshot_id: string;
+  counts: { sources: number; pending_items: number; articles: number };
+  expires_at: number;
+  cursor: string | null;
+}
+
 const runtimeEnv = env as unknown as Omit<TestEnvironment, "API_TOKEN">;
 const testEnv: TestEnvironment = {
   ...runtimeEnv,
@@ -278,6 +286,118 @@ beforeEach(async () => {
 });
 
 describe("consistent export API", () => {
+  it("recovers_only_the_live_export_with_its_counts_expiry_and_current_cursor", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    await seedSource("recovery-source");
+    for (let index = 0; index < 12; index += 1) {
+      await seedArticle(`recovery-article-${String(index).padStart(2, "0")}`, "recovery-source", `Body ${index}`);
+    }
+    const session = await startExport(app);
+    const pageResponse = await apiRequest(app, `/v1/exports/${session.id}`);
+    const { manifest } = parsePage(new TextDecoder().decode(await pageResponse.arrayBuffer()));
+    expect(manifest.next_cursor).toBeTypeOf("string");
+
+    const response = await apiRequest(app, "/v1/exports/active");
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(await response.json<{ session: ActiveExportRecovery }>()).toEqual({
+      session: {
+        id: session.id,
+        snapshot_id: session.snapshot_id,
+        counts: { sources: 1, pending_items: 0, articles: 12 },
+        expires_at: session.expires_at,
+        cursor: manifest.next_cursor,
+      },
+    });
+  });
+
+  it("returns_an_explicit_empty_recovery_result_and_keeps_auth_failures_no_store", async () => {
+    const app = await loadApp();
+    if (!app) return;
+
+    const response = await apiRequest(app, "/v1/exports/active");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(await response.json()).toEqual({ session: null });
+
+    const unauthorized = await app.request("/v1/exports/active", { method: "GET" }, testEnv);
+    expect(unauthorized.status).toBe(401);
+    expect(unauthorized.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("excludes_stale_locks_and_does_not_audit_an_expired_end_attempt", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const session = await startExport(app);
+    const now = Math.floor(Date.now() / 1000);
+    await testEnv.DB.prepare("UPDATE system_state SET export_lock_id = 'stale-lock' WHERE singleton_id = 'global'").run();
+
+    const stale = await apiRequest(app, "/v1/exports/active");
+    expect(await stale.json()).toEqual({ session: null });
+
+    await testEnv.DB.prepare("UPDATE system_state SET export_lock_id = ?, export_lock_expires_at = ? WHERE singleton_id = 'global'")
+      .bind(session.id, now - 1).run();
+    await testEnv.DB.prepare("UPDATE export_sessions SET expires_at = ? WHERE id = ?")
+      .bind(now - 1, session.id).run();
+
+    const expired = await apiRequest(app, "/v1/exports/active");
+    expect(await expired.json()).toEqual({ session: null });
+    const endAttempt = await apiRequest(app, `/v1/exports/${session.id}`, "DELETE");
+    expect(endAttempt.status).toBe(410);
+    expect(await testEnv.DB.prepare("SELECT action FROM operator_actions ORDER BY created_at, rowid").all())
+      .toMatchObject({ results: [{ action: "export.started" }] });
+  });
+
+  it("rolls_back_export_start_and_its_lock_when_audit_insertion_fails", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    await testEnv.DB.prepare(`
+      CREATE TRIGGER fail_export_started_audit
+      BEFORE INSERT ON operator_actions
+      WHEN NEW.action = 'export.started'
+      BEGIN
+        SELECT RAISE(ABORT, 'induced export audit failure');
+      END
+    `).run();
+
+    const response = await apiRequest(app, "/v1/exports", "POST");
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(await testEnv.DB.prepare("SELECT export_lock, export_lock_id FROM system_state WHERE singleton_id = 'global'").first())
+      .toEqual({ export_lock: 0, export_lock_id: null });
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM export_sessions").first())
+      .toEqual({ count: 0 });
+    expect(await testEnv.DB.prepare("SELECT id FROM operator_actions").first()).toBeNull();
+  });
+
+  it("rolls_back_export_end_and_keeps_the_live_session_when_audit_insertion_fails", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    const session = await startExport(app);
+    await testEnv.DB.prepare(`
+      CREATE TRIGGER fail_export_ended_audit
+      BEFORE INSERT ON operator_actions
+      WHEN NEW.action = 'export.ended'
+      BEGIN
+        SELECT RAISE(ABORT, 'induced export audit failure');
+      END
+    `).run();
+
+    const response = await apiRequest(app, `/v1/exports/${session.id}`, "DELETE");
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(await testEnv.DB.prepare("SELECT export_lock, export_lock_id FROM system_state WHERE singleton_id = 'global'").first())
+      .toEqual({ export_lock: 1, export_lock_id: session.id });
+    expect(await testEnv.DB.prepare("SELECT id, state FROM export_sessions WHERE id = ?").bind(session.id).first())
+      .toEqual({ id: session.id, state: "active" });
+    expect(await testEnv.DB.prepare("SELECT action FROM operator_actions ORDER BY created_at, rowid").all())
+      .toMatchObject({ results: [{ action: "export.started" }] });
+  });
+
   it("locks_ingestion_and_all_source_mutations_until_endExport_releases_the_lock", async () => {
     const app = await loadApp();
     if (!app) return;
@@ -301,6 +421,29 @@ describe("consistent export API", () => {
 
     const ended = await apiRequest(app, `/v1/exports/${session.id}`, "DELETE");
     expect(ended.status).toBe(200);
+    const actions = await testEnv.DB.prepare(`
+      SELECT action, target_type, target_id, changed_fields_json
+      FROM operator_actions ORDER BY rowid
+    `).all<{ action: string; target_type: string; target_id: string; changed_fields_json: string }>();
+    expect(actions.results.map((action) => ({
+      action: action.action,
+      target_type: action.target_type,
+      target_id: action.target_id,
+      changed_fields: JSON.parse(action.changed_fields_json) as string[],
+    }))).toEqual([
+      {
+        action: "export.started",
+        target_type: "export",
+        target_id: session.id,
+        changed_fields: ["state", "snapshot_id", "cursor", "expires_at", "snapshot_sources_count", "snapshot_pending_items_count", "snapshot_articles_count"],
+      },
+      {
+        action: "export.ended",
+        target_type: "export",
+        target_id: session.id,
+        changed_fields: ["state", "expires_at"],
+      },
+    ]);
     expect(await testEnv.DB.prepare("SELECT export_lock, export_lock_id, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'").first())
       .toEqual({ export_lock: 0, export_lock_id: null, export_lock_expires_at: null });
     expect(await testEnv.DB.prepare("SELECT id FROM export_sessions WHERE id = ?").bind(session.id).first()).toBeNull();
@@ -371,6 +514,7 @@ describe("consistent export API", () => {
     await expect(repository.startExport(testEnv.DB, now)).rejects.toThrow();
     expect(await testEnv.DB.prepare("SELECT export_lock FROM system_state WHERE singleton_id = 'global'").first())
       .toEqual({ export_lock: 0 });
+    expect(await testEnv.DB.prepare("SELECT id FROM operator_actions").first()).toBeNull();
   });
 
   it("paginates_without_gaps_or_duplicates_and_emits_schema_sources_watermarks_pending_and_full_text", async () => {

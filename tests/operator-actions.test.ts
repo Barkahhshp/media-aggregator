@@ -72,6 +72,48 @@ describe("operator action retention", () => {
     })).toThrow();
   });
 
+  it("prepares_export_lifecycle_audits_with_field_names_only", async () => {
+    const start = prepareOperatorAction(testEnv.DB, {
+      action: "export.started",
+      targetId: "export-session-id",
+      changedFields: ["state", "snapshot_id", "expires_at", "snapshot_articles_count"],
+    });
+    const end = prepareOperatorAction(testEnv.DB, {
+      action: "export.ended",
+      targetId: "export-session-id",
+      changedFields: ["state", "expires_at"],
+    });
+
+    await testEnv.DB.batch([start, end]);
+
+    const actions = await testEnv.DB.prepare(`
+      SELECT actor, action, target_type, target_id, changed_fields_json
+      FROM operator_actions ORDER BY rowid
+    `).all<{ actor: string; action: string; target_type: string; target_id: string; changed_fields_json: string }>();
+    expect(actions.results).toEqual([
+      {
+        actor: "owner",
+        action: "export.started",
+        target_type: "export",
+        target_id: "export-session-id",
+        changed_fields_json: '["state","snapshot_id","expires_at","snapshot_articles_count"]',
+      },
+      {
+        actor: "owner",
+        action: "export.ended",
+        target_type: "export",
+        target_id: "export-session-id",
+        changed_fields_json: '["state","expires_at"]',
+      },
+    ]);
+    expect(JSON.stringify(actions.results)).not.toContain("secret");
+    expect(() => prepareOperatorAction(testEnv.DB, {
+      action: "export.started",
+      targetId: "export-session-id",
+      changedFields: ["https://example.com/private?token=secret"] as never,
+    })).toThrow();
+  });
+
   it("safely retains_rows_when_execution_and_database_clocks_disagree", async () => {
     const databaseNow = Math.floor(Date.now() / 1000);
     await testEnv.DB.prepare(`

@@ -101,3 +101,130 @@ export async function purgeExpiredOperatorActions(db: D1Database, now: number): 
   `).bind(now - OPERATOR_ACTION_RETENTION_SECONDS, OPERATOR_ACTION_RETENTION_SECONDS).run();
   return result.meta.changes;
 }
+
+export const OPERATOR_ACTION_DEFAULT_LIMIT = 50;
+export const OPERATOR_ACTION_MAX_LIMIT = 100;
+
+export interface OperatorActionCursor {
+  createdAt: number;
+  id: string;
+}
+
+export class InvalidOperatorActionCursorError extends Error {
+  constructor() {
+    super("Invalid operator action cursor");
+    this.name = "InvalidOperatorActionCursorError";
+  }
+}
+
+export interface OperatorActionRecord {
+  created_at: number;
+  actor: "owner";
+  action: OperatorActionInput["action"];
+  target_type: "source" | "export";
+  target_id: string;
+  changed_fields: string[];
+}
+
+interface OperatorActionRow {
+  id: string;
+  created_at: number;
+  actor: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  changed_fields_json: string;
+}
+
+function encodeCursor(value: OperatorActionCursor): string {
+  const bytes = new TextEncoder().encode(JSON.stringify({ v: 1, created_at: value.createdAt, id: value.id }));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+}
+
+export function encodeOperatorActionCursor(value: OperatorActionCursor): string {
+  const idBytes = new TextEncoder().encode(value.id).byteLength;
+  if (!Number.isSafeInteger(value.createdAt) || value.createdAt < 0 || idBytes < 1 || idBytes > MAX_OPERATOR_ACTION_TARGET_BYTES) {
+    throw new InvalidOperatorActionCursorError();
+  }
+  return encodeCursor(value);
+}
+
+export function decodeOperatorActionCursor(token: string): OperatorActionCursor {
+  if (token.length === 0 || token.length > 1_024 || !/^[A-Za-z0-9_-]+$/u.test(token)) {
+    throw new InvalidOperatorActionCursorError();
+  }
+  let parsed: unknown;
+  try {
+    const base64 = token.replace(/-/gu, "+").replace(/_/gu, "/");
+    const binary = atob(base64 + "=".repeat((4 - (base64.length % 4)) % 4));
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+  } catch {
+    throw new InvalidOperatorActionCursorError();
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new InvalidOperatorActionCursorError();
+  const value = parsed as Record<string, unknown>;
+  if (value.v !== 1 || typeof value.created_at !== "number" || typeof value.id !== "string") {
+    throw new InvalidOperatorActionCursorError();
+  }
+  const cursor = { createdAt: value.created_at, id: value.id };
+  const idBytes = new TextEncoder().encode(cursor.id).byteLength;
+  if (!Number.isSafeInteger(cursor.createdAt) || cursor.createdAt < 0 || idBytes < 1 || idBytes > MAX_OPERATOR_ACTION_TARGET_BYTES) {
+    throw new InvalidOperatorActionCursorError();
+  }
+  return cursor;
+}
+
+function changedFieldNames(row: OperatorActionRow): string[] {
+  const allowed: ReadonlySet<string> = row.action.startsWith("source.") ? SOURCE_FIELDS : EXPORT_FIELDS;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.changed_fields_json) as unknown;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return [...new Set(parsed.filter((field): field is string => typeof field === "string" && allowed.has(field)))];
+}
+
+export async function listOperatorActions(
+  db: D1Database,
+  limit: number,
+  now: number,
+  cursor?: OperatorActionCursor,
+): Promise<{ actions: OperatorActionRecord[]; nextCursor: string | null }> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > OPERATOR_ACTION_MAX_LIMIT) {
+    throw new RangeError("limit must be between 1 and 100");
+  }
+  if (!Number.isSafeInteger(now) || now <= 0) throw new RangeError("now must be a positive integer epoch timestamp");
+  const predicates = ["created_at >= ?", "created_at <= ?"];
+  const bindings: unknown[] = [now - OPERATOR_ACTION_RETENTION_SECONDS, now];
+  if (cursor !== undefined) {
+    predicates.push("(created_at < ? OR (created_at = ? AND id < ?))");
+    bindings.push(cursor.createdAt, cursor.createdAt, cursor.id);
+  }
+  bindings.push(limit);
+  const result = await db.prepare(`
+    SELECT id, created_at, actor, action, target_type, target_id, changed_fields_json
+    FROM operator_actions
+    WHERE ${predicates.join(" AND ")}
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?
+  `).bind(...bindings).all<OperatorActionRow>();
+  const rows = result.results;
+  const actions = rows.map((row) => ({
+    created_at: Number(row.created_at),
+    actor: "owner" as const,
+    action: row.action as OperatorActionInput["action"],
+    target_type: row.target_type as "source" | "export",
+    target_id: row.target_id,
+    changed_fields: changedFieldNames(row),
+  }));
+  const last = rows.length === limit ? rows[rows.length - 1] : undefined;
+  return {
+    actions,
+    nextCursor: last ? encodeOperatorActionCursor({ createdAt: Number(last.created_at), id: last.id }) : null,
+  };
+}

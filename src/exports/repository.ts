@@ -1,4 +1,5 @@
 import { checkWriteGate, completeWriteReservation } from "../ingest/storage-guard";
+import { prepareOperatorAction } from "../audit/repository";
 
 export const EXPORT_SCHEMA_VERSION = 1;
 export const EXPORT_LOCK_SECONDS = 30 * 60;
@@ -183,6 +184,24 @@ export async function getExportSession(db: D1Database, id: string): Promise<Expo
   return sessionFromRow(row);
 }
 
+export async function getActiveExportSession(db: D1Database, now = nowSeconds()): Promise<ExportSession | null> {
+  const row = await db.prepare(`
+    SELECT session.id, session.snapshot_id, session.export_watermark, session.cursor,
+      MIN(session.expires_at, state.export_lock_expires_at) AS expires_at,
+      session.state, session.created_at, session.updated_at,
+      session.snapshot_sources_count, session.snapshot_pending_items_count, session.snapshot_articles_count
+    FROM export_sessions AS session
+    JOIN system_state AS state
+      ON state.singleton_id = 'global'
+      AND state.export_lock = 1
+      AND state.export_lock_id = session.id
+      AND state.export_lock_expires_at > ?
+    WHERE session.state = 'active' AND session.expires_at > ?
+    LIMIT 1
+  `).bind(now, now).first<Record<string, unknown>>();
+  return sessionFromRow(row);
+}
+
 export async function startExport(db: D1Database, now = nowSeconds()): Promise<ExportSession> {
   const id = crypto.randomUUID();
   const snapshotId = crypto.randomUUID();
@@ -226,6 +245,19 @@ export async function startExport(db: D1Database, now = nowSeconds()): Promise<E
         snapshot_pending_items_count AS pending_items,
         snapshot_articles_count AS articles
       `).bind(id),
+      prepareOperatorAction(db, {
+        action: "export.started",
+        targetId: id,
+        changedFields: [
+          "state",
+          "snapshot_id",
+          "cursor",
+          "expires_at",
+          "snapshot_sources_count",
+          "snapshot_pending_items_count",
+          "snapshot_articles_count",
+        ],
+      }, { onlyIfPreviousStatementChanged: true }),
     ]);
     latestSize = results.reduce((largest, result) => Math.max(largest, result.meta.size_after ?? reservation.measuredSize), reservation.measuredSize);
     const acquired = results[1]?.results?.[0] as { export_lock_id?: string } | undefined;
@@ -414,14 +446,30 @@ export async function getExportPage(
   };
 }
 
-export async function endExport(db: D1Database, sessionId: string, now = nowSeconds()): Promise<void> {
-  await db.batch([
+export async function endExport(db: D1Database, sessionId: string, now = nowSeconds()): Promise<boolean> {
+  const results = await db.batch([
     db.prepare(`
       UPDATE system_state
       SET export_lock = 0, export_lock_id = NULL, export_lock_expires_at = NULL, updated_at = ?
-      WHERE singleton_id = 'global' AND export_lock_id = ?
-    `).bind(now, sessionId),
-    db.prepare("DELETE FROM export_sessions WHERE id = ?")
-      .bind(sessionId),
+      WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_id = ?
+        AND export_lock_expires_at > ?
+        AND EXISTS (
+          SELECT 1 FROM export_sessions
+          WHERE id = ? AND state = 'active' AND expires_at > ?
+        )
+      RETURNING singleton_id
+    `).bind(now, sessionId, now, sessionId, now),
+    db.prepare(`
+      DELETE FROM export_sessions
+      WHERE id = ? AND state = 'active' AND expires_at > ? AND changes() > 0
+      RETURNING id
+    `).bind(sessionId, now),
+    prepareOperatorAction(db, {
+      action: "export.ended",
+      targetId: sessionId,
+      changedFields: ["state", "expires_at"],
+    }, { onlyIfPreviousStatementChanged: true }),
   ]);
+  const deletedId = (results[1]?.results?.[0] as { id?: string } | undefined)?.id;
+  return deletedId === sessionId && Number(results[2]?.meta.changes ?? 0) > 0;
 }
