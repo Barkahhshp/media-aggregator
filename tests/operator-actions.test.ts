@@ -2,7 +2,7 @@ import { applyD1Migrations, reset } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
-import { purgeExpiredOperatorActions } from "../src/audit/repository";
+import { prepareOperatorAction, purgeExpiredOperatorActions } from "../src/audit/repository";
 
 interface TestBindings {
   DB: D1Database;
@@ -35,6 +35,41 @@ describe("operator action retention", () => {
     const remaining = await testEnv.DB.prepare("SELECT id FROM operator_actions ORDER BY id")
       .all<{ id: string }>();
     expect(remaining.results).toEqual([{ id: "retained-action" }]);
+  });
+
+  it("prepares_bounded_field_name_only_actions_for_a_database_batch", async () => {
+    const statement = prepareOperatorAction(testEnv.DB, {
+      action: "source.updated",
+      targetId: "source-1",
+      changedFields: ["poll_interval_sec", "selectors"],
+    });
+
+    await testEnv.DB.batch([statement]);
+
+    const action = await testEnv.DB.prepare(`
+      SELECT actor, action, target_type, target_id, changed_fields_json
+      FROM operator_actions WHERE target_id = 'source-1'
+    `).first<{ actor: string; action: string; target_type: string; target_id: string; changed_fields_json: string }>();
+    expect(action).toEqual({
+      actor: "owner",
+      action: "source.updated",
+      target_type: "source",
+      target_id: "source-1",
+      changed_fields_json: '["poll_interval_sec","selectors"]',
+    });
+  });
+
+  it("rejects_invalid_or_oversized_audit_input_before_preparing_sql", () => {
+    expect(() => prepareOperatorAction(testEnv.DB, {
+      action: "source.updated",
+      targetId: "source-1",
+      changedFields: ["https://example.com/private?token=secret"] as never,
+    })).toThrow();
+    expect(() => prepareOperatorAction(testEnv.DB, {
+      action: "source.updated",
+      targetId: "x".repeat(129),
+      changedFields: ["url"],
+    })).toThrow();
   });
 
   it("safely retains_rows_when_execution_and_database_clocks_disagree", async () => {

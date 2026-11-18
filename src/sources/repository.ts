@@ -1,5 +1,6 @@
 import type { ArticleSelectors, Source, SourceInput, SourceKind } from "./types";
 import { MAX_ACTIVE_SOURCES } from "./validation";
+import { prepareOperatorAction, type SourceAuditField } from "../audit/repository";
 
 interface SourceRow {
   id: string;
@@ -56,15 +57,41 @@ function toSource(row: SourceRow): Source {
   };
 }
 
+async function getSourceRow(db: D1Database, id: string): Promise<SourceRow | null> {
+  return await db.prepare("SELECT * FROM sources WHERE id = ?").bind(id).first<SourceRow>();
+}
+
 export async function getSource(db: D1Database, id: string): Promise<Source | null> {
-  const row = await db.prepare("SELECT * FROM sources WHERE id = ?").bind(id).first<SourceRow>();
+  const row = await getSourceRow(db, id);
   return row === null ? null : toSource(row);
+}
+
+function canonicalSelectors(value: ArticleSelectors | null): string | null {
+  if (value === null) return null;
+  const entries = Object.entries(value).sort(([left], [right]) => left.localeCompare(right));
+  return JSON.stringify(Object.fromEntries(entries));
+}
+
+function changedSourceFields(row: SourceRow, input: SourceInput, enabled?: boolean): SourceAuditField[] {
+  const current = toSource(row);
+  const fields: SourceAuditField[] = [];
+  if (current.kind !== input.kind) fields.push("kind");
+  if (current.url !== new URL(input.url).toString()) fields.push("url");
+  if (current.poll_interval_sec !== input.poll_interval_sec) fields.push("poll_interval_sec");
+  if (canonicalSelectors(current.selectors) !== canonicalSelectors(input.selectors ?? null)) fields.push("selectors");
+  if (enabled !== undefined && current.enabled !== enabled) fields.push("enabled");
+  const order: SourceAuditField[] = ["kind", "url", "poll_interval_sec", "selectors", "enabled"];
+  return order.filter((field) => fields.includes(field));
 }
 
 export async function createSource(db: D1Database, input: SourceInput): Promise<Source> {
   const url = new URL(input.url);
-  const row = await db
-    .prepare(
+  const id = crypto.randomUUID();
+  const sourceFields: SourceAuditField[] = ["kind", "url", "poll_interval_sec"];
+  if (input.selectors !== undefined) sourceFields.push("selectors");
+  sourceFields.push("enabled");
+  const results = await db.batch<SourceRow>([
+    db.prepare(
       `INSERT INTO sources (id, url, kind, host, poll_interval_sec, selectors_json)
        SELECT ?, ?, ?, ?, ?, ?
        WHERE (SELECT COUNT(*) FROM sources WHERE enabled = 1) < ?
@@ -73,17 +100,22 @@ export async function createSource(db: D1Database, input: SourceInput): Promise<
            WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_expires_at > unixepoch()
          )
        RETURNING *`,
-    )
-    .bind(
-      crypto.randomUUID(),
+    ).bind(
+      id,
       url.toString(),
       input.kind,
       url.hostname.toLowerCase(),
       input.poll_interval_sec,
       input.selectors === undefined ? null : JSON.stringify(input.selectors),
       MAX_ACTIVE_SOURCES,
-    )
-    .first<SourceRow>();
+    ),
+    prepareOperatorAction(db, {
+      action: "source.created",
+      targetId: id,
+      changedFields: sourceFields,
+    }, { onlyIfPreviousStatementChanged: true }),
+  ]);
+  const row = results[0]?.results[0] ?? null;
 
   if (row === null) {
     const lock = await db.prepare("SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'")
@@ -126,68 +158,111 @@ export async function updateSource(
 ): Promise<Source | null> {
   const url = new URL(input.url);
   const nextEnabled = enabled === undefined ? null : Number(enabled);
-  const row = await db
-    .prepare(
-      `UPDATE sources
-       SET url = ?, kind = ?, host = ?, poll_interval_sec = ?, selectors_json = ?, enabled = COALESCE(?, enabled),
-           last_status = CASE
-             WHEN COALESCE(?, enabled) = 0 THEN 'disabled_source'
-             WHEN COALESCE(?, enabled) = 1 AND last_status = 'disabled_source' THEN NULL
-             ELSE last_status
-           END,
-           updated_at = unixepoch()
-       WHERE id = ?
-         AND (COALESCE(?, enabled) = 0 OR enabled = 1 OR (SELECT COUNT(*) FROM sources WHERE enabled = 1) < ?)
-         AND NOT EXISTS (
-           SELECT 1 FROM system_state
-           WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_expires_at > unixepoch()
-         )
-       RETURNING *`,
-    )
-    .bind(
-      url.toString(),
-      input.kind,
-      url.hostname.toLowerCase(),
-      input.poll_interval_sec,
-      input.selectors === undefined ? null : JSON.stringify(input.selectors),
-      nextEnabled,
-      nextEnabled,
-      nextEnabled,
-      id,
-      nextEnabled,
-      MAX_ACTIVE_SOURCES,
-    )
-    .first<SourceRow>();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const before = await getSourceRow(db, id);
+    if (before === null) return null;
+    const fields = changedSourceFields(before, input, enabled);
+    const statements = [
+      db.prepare(
+        `UPDATE sources
+         SET url = ?, kind = ?, host = ?, poll_interval_sec = ?, selectors_json = ?, enabled = COALESCE(?, enabled),
+             last_status = CASE
+               WHEN COALESCE(?, enabled) = 0 THEN 'disabled_source'
+               WHEN COALESCE(?, enabled) = 1 AND last_status = 'disabled_source' THEN NULL
+               ELSE last_status
+             END,
+             updated_at = unixepoch()
+         WHERE id = ?
+           AND (COALESCE(?, enabled) = 0 OR enabled = 1 OR (SELECT COUNT(*) FROM sources WHERE enabled = 1) < ?)
+           AND NOT EXISTS (
+             SELECT 1 FROM system_state
+             WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_expires_at > unixepoch()
+           )
+           AND url IS ? AND kind IS ? AND poll_interval_sec = ? AND selectors_json IS ? AND enabled = ?
+         RETURNING *`,
+      ).bind(
+        url.toString(),
+        input.kind,
+        url.hostname.toLowerCase(),
+        input.poll_interval_sec,
+        input.selectors === undefined ? null : JSON.stringify(input.selectors),
+        nextEnabled,
+        nextEnabled,
+        nextEnabled,
+        id,
+        nextEnabled,
+        MAX_ACTIVE_SOURCES,
+        before.url,
+        before.kind,
+        before.poll_interval_sec,
+        before.selectors_json,
+        before.enabled,
+      ),
+    ];
+    if (fields.length > 0) {
+      statements.push(prepareOperatorAction(db, {
+        action: enabled === false && before.enabled === 1 ? "source.disabled" : "source.updated",
+        targetId: id,
+        changedFields: fields,
+      }, { onlyIfPreviousStatementChanged: true }));
+    }
+    const results = await db.batch<SourceRow>(statements);
+    const row = results[0]?.results[0] ?? null;
+    if (row !== null) return toSource(row);
 
-  if (row !== null) return toSource(row);
-  const lock = await db.prepare("SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'")
-    .first<{ export_lock: number; export_lock_expires_at: number | null }>();
-  if (lock?.export_lock === 1 && (lock.export_lock_expires_at ?? 0) > Math.floor(Date.now() / 1000)) {
-    throw new SourceRepositoryError(423, "export_in_progress", "Source changes are paused during export");
-  }
-  const existing = await getSource(db, id);
-  if (existing === null) return null;
-  throw new SourceRepositoryError(409, "source_limit_reached", "Maximum of 100 active sources reached");
-}
+    const after = await getSourceRow(db, id);
+    if (after === null) return null;
+    const configChangedConcurrently = before.url !== after.url
+      || before.kind !== after.kind
+      || before.poll_interval_sec !== after.poll_interval_sec
+      || before.selectors_json !== after.selectors_json
+      || before.enabled !== after.enabled;
+    if (configChangedConcurrently) continue;
 
-export async function disableSource(db: D1Database, id: string): Promise<Source | null> {
-  const row = await db
-    .prepare(`
-      UPDATE sources SET enabled = 0, last_status = 'disabled_source', updated_at = unixepoch()
-      WHERE id = ? AND NOT EXISTS (
-        SELECT 1 FROM system_state
-        WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_expires_at > unixepoch()
-      )
-      RETURNING *
-    `)
-    .bind(id)
-    .first<SourceRow>();
-  if (row === null) {
     const lock = await db.prepare("SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'")
       .first<{ export_lock: number; export_lock_expires_at: number | null }>();
     if (lock?.export_lock === 1 && (lock.export_lock_expires_at ?? 0) > Math.floor(Date.now() / 1000)) {
       throw new SourceRepositoryError(423, "export_in_progress", "Source changes are paused during export");
     }
+    throw new SourceRepositoryError(409, "source_limit_reached", "Maximum of 100 active sources reached");
   }
-  return row === null ? null : toSource(row);
+  throw new SourceRepositoryError(409, "source_update_conflict", "Source changed during update; retry the request");
+}
+
+export async function disableSource(db: D1Database, id: string): Promise<Source | null> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const before = await getSourceRow(db, id);
+    if (before === null) return null;
+    const statements = [
+      db.prepare(`
+        UPDATE sources SET enabled = 0, last_status = 'disabled_source', updated_at = unixepoch()
+        WHERE id = ? AND enabled = ? AND NOT EXISTS (
+          SELECT 1 FROM system_state
+          WHERE singleton_id = 'global' AND export_lock = 1 AND export_lock_expires_at > unixepoch()
+        )
+        RETURNING *
+      `).bind(id, before.enabled),
+    ];
+    if (before.enabled === 1) {
+      statements.push(prepareOperatorAction(db, {
+        action: "source.disabled",
+        targetId: id,
+        changedFields: ["enabled"],
+      }, { onlyIfPreviousStatementChanged: true }));
+    }
+    const results = await db.batch<SourceRow>(statements);
+    const row = results[0]?.results[0] ?? null;
+    if (row !== null) return toSource(row);
+
+    const after = await getSourceRow(db, id);
+    if (after === null) return null;
+    if (before.enabled !== after.enabled) continue;
+    const lock = await db.prepare("SELECT export_lock, export_lock_expires_at FROM system_state WHERE singleton_id = 'global'")
+      .first<{ export_lock: number; export_lock_expires_at: number | null }>();
+    if (lock?.export_lock === 1 && (lock.export_lock_expires_at ?? 0) > Math.floor(Date.now() / 1000)) {
+      throw new SourceRepositoryError(423, "export_in_progress", "Source changes are paused during export");
+    }
+    return toSource(after);
+  }
+  throw new SourceRepositoryError(409, "source_update_conflict", "Source changed during disable; retry the request");
 }

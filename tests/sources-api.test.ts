@@ -109,6 +109,112 @@ describe("source management API", () => {
     expect(disabled.source.enabled).toBe(false);
   });
 
+  it("audits_source_creation_configuration_changes_and_disable_without_values", async () => {
+    const app = await loadApp();
+    if (!app) return;
+
+    const sourceUrl = "https://example.com/private-feed?token=url-secret-value";
+    const selectorValue = "article[data-private-selector='selector-secret-value']";
+    const createdResponse = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "html_list",
+      url: sourceUrl,
+      selectors: { title: selectorValue, body: "body-secret-value", itemLink: "link-secret-value" },
+    });
+    expect(createdResponse.status).toBe(201);
+    const created = await createdResponse.json<{ source: { id: string } }>();
+
+    const updatedResponse = await sourceRequest(app, `/v1/sources/${created.source.id}`, "PATCH", {
+      poll_interval_sec: 900,
+      selectors: { title: "updated-selector-secret-value", body: "updated-body-secret-value", itemLink: "updated-link-secret-value" },
+    });
+    expect(updatedResponse.status).toBe(200);
+    const disabledResponse = await sourceRequest(app, `/v1/sources/${created.source.id}`, "DELETE");
+    expect(disabledResponse.status).toBe(200);
+
+    const actions = await testEnv.DB.prepare(`
+      SELECT action, target_type, target_id, changed_fields_json
+      FROM operator_actions ORDER BY created_at ASC, rowid ASC
+    `).all<{ action: string; target_type: string; target_id: string; changed_fields_json: string }>();
+    expect(actions.results).toHaveLength(3);
+    expect(actions.results.map((action) => ({
+      action: action.action,
+      target_type: action.target_type,
+      target_id: action.target_id,
+      changed_fields: JSON.parse(action.changed_fields_json) as string[],
+    }))).toEqual([
+      {
+        action: "source.created",
+        target_type: "source",
+        target_id: created.source.id,
+        changed_fields: ["kind", "url", "poll_interval_sec", "selectors", "enabled"],
+      },
+      {
+        action: "source.updated",
+        target_type: "source",
+        target_id: created.source.id,
+        changed_fields: ["poll_interval_sec", "selectors"],
+      },
+      {
+        action: "source.disabled",
+        target_type: "source",
+        target_id: created.source.id,
+        changed_fields: ["enabled"],
+      },
+    ]);
+    const serializedAudit = JSON.stringify(actions.results);
+    for (const secretValue of [testEnv.API_TOKEN, sourceUrl, selectorValue, "body-secret-value", "updated-selector-secret-value"]) {
+      expect(serializedAudit).not.toContain(secretValue);
+    }
+  });
+
+  it("does_not_audit_invalid_storage_gated_or_export_locked_mutations", async () => {
+    const app = await loadApp();
+    if (!app) return;
+
+    const invalid = await sourceRequest(app, "/v1/sources", "POST", { kind: "unknown", url: "https://example.com" });
+    expect(invalid.status).toBe(400);
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = ?, storage_state = 'storage_limit' WHERE singleton_id = 'global'")
+      .bind(280 * 1024 * 1024).run();
+    const gated = await sourceRequest(app, "/v1/sources", "POST", { kind: "feed", url: "https://example.com/gated-feed" });
+    expect(gated.status).toBe(503);
+    await testEnv.DB.prepare("UPDATE system_state SET observed_db_size = 0, reserved_db_bytes = 0, storage_state = 'normal' WHERE singleton_id = 'global'").run();
+
+    const created = await sourceRequest(app, "/v1/sources", "POST", { kind: "feed", url: "https://example.com/locked-feed" });
+    const source = await created.json<{ source: { id: string } }>();
+    await testEnv.DB.prepare("UPDATE system_state SET export_lock = 1, export_lock_id = 'locked', export_lock_expires_at = ? WHERE singleton_id = 'global'")
+      .bind(Math.floor(Date.now() / 1000) + 600).run();
+    const locked = await sourceRequest(app, `/v1/sources/${source.source.id}`, "PATCH", { poll_interval_sec: 900 });
+    expect(locked.status).toBe(423);
+
+    const actions = await testEnv.DB.prepare("SELECT action FROM operator_actions ORDER BY created_at, rowid")
+      .all<{ action: string }>();
+    expect(actions.results).toEqual([{ action: "source.created" }]);
+    expect(await testEnv.DB.prepare("SELECT poll_interval_sec FROM sources WHERE id = ?").bind(source.source.id).first())
+      .toEqual({ poll_interval_sec: 7200 });
+  });
+
+  it("rolls_back_a_source_creation_when_its_audit_insert_fails", async () => {
+    const app = await loadApp();
+    if (!app) return;
+    await testEnv.DB.prepare(`
+      CREATE TRIGGER fail_source_created_audit
+      BEFORE INSERT ON operator_actions
+      WHEN NEW.action = 'source.created'
+      BEGIN
+        SELECT RAISE(ABORT, 'induced audit write failure');
+      END
+    `).run();
+
+    const response = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed",
+      url: "https://example.com/audit-rollback-feed",
+    });
+
+    expect(response.status).toBe(500);
+    expect(await testEnv.DB.prepare("SELECT id FROM sources WHERE url = 'https://example.com/audit-rollback-feed'").first()).toBeNull();
+    expect(await testEnv.DB.prepare("SELECT id FROM operator_actions").first()).toBeNull();
+  });
+
   it("exposes_per_source_pending_backlog_and_global_storage_status", async () => {
     const app = await loadApp();
     if (!app) return;
