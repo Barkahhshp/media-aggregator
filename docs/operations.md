@@ -4,9 +4,39 @@
 
 Production authentication uses one encrypted Cloudflare Worker secret named `API_TOKEN`; Cloudflare Access and Zero Trust are not required. Configure the secret through the normal, owner-authorized Worker secret workflow. Never commit, print, log, return, or place the token in backup files.
 
-Callers must send the exact configured token in `Authorization: Bearer <token>` for both `GET /health` and every `/v1/*` route. Missing, malformed, wrong, empty, or absent production configuration is rejected with a generic `401` response. The Worker hashes the accepted token with SHA-256 before calling the configured `RATE_LIMITER`; the raw token is never used as a limiter key. The existing default is 120 requests per 60 seconds per token, per Cloudflare location. Cloudflare's Worker Rate Limiting API is approximate and location-local, so counts may briefly exceed the limit and are not a strict global quota. No Cloudflare resource is created by this repository change.
+In production, callers must send the exact configured token in `Authorization: Bearer <token>` for both `GET /health` and every `/v1/*` route. Every `/v1/*` route also requires the configured token in local development; `/health` retains its existing unauthenticated local behavior. Missing, malformed, wrong, empty, or absent production configuration is rejected with a generic `401` response. The Worker hashes the accepted token with SHA-256 before calling the configured `RATE_LIMITER`; the raw token is never used as a limiter key. The existing default is 120 requests per 60 seconds per token, per Cloudflare location. Cloudflare's Worker Rate Limiting API is approximate and location-local, so counts may briefly exceed the limit and are not a strict global quota. No Cloudflare resource is created by this repository change.
 
 `GET /v1/status` reports active and disabled pending counts, the age of the oldest retained pending item, and the latest measured D1 size/storage state. `GET /v1/sources` includes each source's `pending_count` and `oldest_pending_at`. Disabling a source retains its backlog, marks it `disabled_source`, and keeps it out of fetch claims; enable it again when you want that backlog to resume. Keep both status endpoints behind the same Bearer-token protection as the rest of `/v1/*`.
+
+## Run the dashboard locally
+
+The dashboard is built into `dashboard/dist/` and served as static assets by the same Worker that handles `/v1/*`; it does not use a separate API origin. Create a local-only `API_TOKEN` in the ignored `.dev.vars` file before starting the Worker. Do not copy a production credential into documentation, a URL, or the repository.
+
+From the repository root, create a fresh local persistence directory, apply and list migrations against that local D1 only, build the dashboard, then start Wrangler in local mode:
+
+```bash
+LOCAL_STATE="$(mktemp -d)"
+npx wrangler d1 migrations apply media-aggregator --local --persist-to "$LOCAL_STATE"
+npx wrangler d1 migrations list media-aggregator --local --persist-to "$LOCAL_STATE"
+npm run build:dashboard
+npx wrangler dev --local --ip 127.0.0.1 --port 8787 --persist-to "$LOCAL_STATE"
+```
+
+Open <http://127.0.0.1:8787>. The sign-in form accepts the Bearer token without placing it in the URL. The dashboard keeps it only in volatile memory for the current tab; it is cleared on logout, after 15 minutes without activity, or after a `401`, and a page reload requires signing in again. API requests are same-origin, send the token in the `Authorization` header, and use `cache: "no-store"`. The UI does not persist the token in browser storage, cookies, or a service worker.
+
+Private `/v1/*` responses, including errors, use `Cache-Control: no-store`; dashboard HTML is also non-cacheable. The Worker applies a same-origin Content Security Policy (`default-src`, scripts, styles, and connections restricted to `'self'`; objects and framing disallowed; base URI restricted to `'self'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `X-Frame-Options: DENY`. Keep the local server local; do not enable a tunnel or remote bindings for this workflow.
+
+## Dashboard backups and local restore
+
+Before starting a dashboard export, review its warning: the export lock pauses scheduler work and blocks source changes while the snapshot is downloaded. The page shows the snapshot ID, record counts, page/record progress, and expiry. It attempts to release the lock after both a successful and a failed download; if cleanup cannot be confirmed, the UI reports that the lock may remain until the displayed expiry. On reload, an active snapshot can be recovered, but download starts again at page one so a partial remainder is never presented as a complete backup.
+
+When supported, the browser writes the NDJSON incrementally to the selected file. Otherwise, the Blob fallback holds the complete backup in browser memory until download, which can use substantial memory for large snapshots. The dashboard does not provide remote restore, archival retention, or a whole-backup checksum. Restore remains a local CLI operation against a new, empty local D1 database:
+
+```bash
+D1_LOCAL_PERSIST=/tmp/media-aggregator-restore npm run restore:export -- "$BACKUP"
+```
+
+Choose a fresh disposable directory for `D1_LOCAL_PERSIST`; the command applies migrations with `--local`, disables remote bindings, and refuses a populated target. Keep the NDJSON file private. The existing restore command checks manifest counts and verifies retained article content hashes.
 
 ## Migrations and local checks
 
@@ -16,12 +46,15 @@ Wrangler local D1 uses a separate local database, not the production database. A
 npx wrangler d1 migrations list media-aggregator --local
 npx wrangler d1 migrations apply media-aggregator --local
 npm test
+npm run test:dashboard
 npm run lint
 npm run typecheck
+npm run typecheck:dashboard
+npm run build:dashboard
 npm run build
 ```
 
-`npm run build` is configured as a Wrangler dry run and does not publish the Worker. For a later, deliberate production migration, review the active Wrangler environment and database binding first, then use `npx wrangler d1 migrations apply media-aggregator --remote` only with the appropriate account authorization and change approval. Wrangler stores versioned SQL migration files under `migrations/`; see Cloudflare's [D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/) and [local development](https://developers.cloudflare.com/d1/best-practices/local-development/) guides.
+`npm run build:dashboard` writes assets only to `dashboard/dist/`. `npm run build` includes that dashboard build and runs Wrangler with `--dry-run`; it does not publish the Worker and does not use the repository root `dist/` as the dashboard asset source. For the normal local database use `--local`; for an isolated local database, pass the same fresh `--persist-to` directory to Wrangler D1 and `wrangler dev` commands. For a later, deliberate production migration, review the active Wrangler environment and database binding first, then use `npx wrangler d1 migrations apply media-aggregator --remote` only with the appropriate account authorization and change approval. Wrangler stores versioned SQL migration files under `migrations/`; see Cloudflare's [D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/) and [local development](https://developers.cloudflare.com/d1/best-practices/local-development/) guides.
 
 ## D1 Time Travel
 
@@ -100,7 +133,7 @@ npm run restore:export -- "$BACKUP"
 
 The command applies configured migrations with `--local`, opens the Wrangler local D1 binding with remote bindings disabled, refuses a populated target, restores rows with parameterized D1 writes, checks manifest row counts, and reads every restored article in small batches. It verifies the SHA-256 of each retained body; for `content_too_large` with an empty stored body, it preserves the source-body hash and validates the explicit status/empty-body case because the original oversized bytes are absent from the backup. It never selects a remote D1 binding. If restoration fails partway through, recreate or clear the local D1 database before retrying; do not append a second restore to a partially restored database.
 
-For a disposable local database separate from the default Wrangler state, set `D1_LOCAL_PERSIST` to a local directory, for example: `D1_LOCAL_PERSIST=/tmp/media-aggregator-restore npm run restore:export -- "$BACKUP"`.
+For a disposable local database separate from the default Wrangler state, set `D1_LOCAL_PERSIST` to a new, empty local directory, for example: `D1_LOCAL_PERSIST=/tmp/media-aggregator-restore npm run restore:export -- "$BACKUP"`.
 
 ## Resource caps and operational behavior
 

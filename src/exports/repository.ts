@@ -1,5 +1,5 @@
-import { checkWriteGate, completeWriteReservation } from "../ingest/storage-guard";
-import { prepareOperatorAction } from "../audit/repository";
+import { checkWriteGate, completeWriteReservation } from "../ingest/storage-guard.ts";
+import { prepareOperatorAction } from "../audit/repository.ts";
 
 export const EXPORT_SCHEMA_VERSION = 1;
 export const EXPORT_LOCK_SECONDS = 30 * 60;
