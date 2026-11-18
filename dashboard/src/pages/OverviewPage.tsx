@@ -168,9 +168,10 @@ export function OverviewPage({ session, onNavigate }: OverviewPageProps) {
             <p>{formatCount(overview.pending.disabled_count, "disabled-source backlog")}</p>
             {overview.pending.active_count === 0 && overview.pending.disabled_count === 0 && <p className="empty-message">No pending backlog</p>}
             <p>{overview.pending.oldest_age_seconds === null ? "No active backlog age" : `Oldest active item: ${formatAge(overview.pending.oldest_age_seconds)} ago`}</p>
-            {overview.pending.active_count > 0 && (
+            {(overview.pending.active_count > 0 || overview.pending.disabled_count > 0) && (
               <div className="problem-links">
-                <FilterLink href="/pending?status=pending" onNavigate={onNavigate}>View active backlog</FilterLink>
+                {overview.pending.active_count > 0 && <FilterLink href="/sources?filter=backlog" onNavigate={onNavigate}>View backlog sources</FilterLink>}
+                {overview.pending.disabled_count > 0 && <FilterLink href="/sources?filter=backlog&enabled=disabled" onNavigate={onNavigate}>View disabled-backlog sources</FilterLink>}
               </div>
             )}
           </article>
@@ -200,7 +201,6 @@ export function OverviewPage({ session, onNavigate }: OverviewPageProps) {
                 <p>Started {formatTimestamp(overview.latest_run.started_at)} · {overview.latest_run.duration_seconds}s</p>
                 <p>{overview.latest_run.stored_count} stored of {overview.latest_run.discovered_count} discovered</p>
                 {overview.latest_run.error_message !== null && <p className="error-copy">{overview.latest_run.error_message}</p>}
-                <FilterLink href={`/runs/${encodeURIComponent(overview.latest_run.id)}`} onNavigate={onNavigate}>View latest run</FilterLink>
               </>
             )}
           </article>
@@ -220,16 +220,10 @@ export function OverviewPage({ session, onNavigate }: OverviewPageProps) {
             <div className="run-summary-grid">
               {runStatuses.map((status) => {
                 const count = overview.runs_24h[status] ?? 0;
-                const filterHref = `/runs?status=${encodeURIComponent(status)}`;
                 return (
                   <article className="run-summary-card" key={status}>
                     <StatusBadge status={status} />
                     <p>{count} {status === "storage_limit" ? "storage limit" : status}</p>
-                    {count > 0 && (status === "partial" || status === "failed" || status === "blocked" || status === "storage_limit") && (
-                      <FilterLink href={filterHref} onNavigate={onNavigate}>
-                        {`View ${status === "storage_limit" ? "storage-limit" : status} runs`}
-                      </FilterLink>
-                    )}
                   </article>
                 );
               })}
@@ -237,8 +231,7 @@ export function OverviewPage({ session, onNavigate }: OverviewPageProps) {
           )}
           {overview.pending.by_status.active.blocked > 0 && (
             <p className="problem-callout">
-              {overview.pending.by_status.active.blocked} active pending items are blocked. They are not empty-feed results. {" "}
-              <FilterLink href="/errors?origin=pending&status=blocked" onNavigate={onNavigate}>View blocked pending items</FilterLink>
+              {overview.pending.by_status.active.blocked} active pending items are blocked. They are not empty-feed results.
             </p>
           )}
         </section>

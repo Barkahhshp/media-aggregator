@@ -133,7 +133,10 @@ export function SourcesPage({ session, onNavigate }: SourcesPageProps) {
   }, [loadSources]);
 
   const activeFilter = new URLSearchParams(window.location.search).get("filter");
+  const enabledFilter = new URLSearchParams(window.location.search).get("enabled");
   const visibleSources = sources.filter((source) => {
+    if (enabledFilter === "disabled" && source.enabled) return false;
+    if (enabledFilter === "enabled" && !source.enabled) return false;
     if (activeFilter === "overdue") return isOverdue(source);
     if (activeFilter === "backlog") return source.pending_count > 0;
     return true;
@@ -302,7 +305,7 @@ export function SourcesPage({ session, onNavigate }: SourcesPageProps) {
         ) : visibleSources.length === 0 ? (
           <section className="empty-state">
             <h3>No sources match this filter</h3>
-            <p>There are no matching overdue sources or sources with an active backlog.</p>
+            <p>There are no sources that match the selected status and backlog filters.</p>
             <a href="/sources" onClick={(event) => { event.preventDefault(); navigate("/sources"); }}>Clear filter</a>
           </section>
         ) : (

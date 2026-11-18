@@ -203,29 +203,31 @@ describe("Sources page", () => {
     expect(screen.getByRole("button", { name: /disable feed.example.test/i })).toBeTruthy();
   });
 
-  it("opens the overdue-source filter when an Overview problem link is selected", async () => {
-    const overdueSource = sourceFixture();
-    const futureSource = sourceFixture({ id: "source-future", host: "later.example.test", next_fetch_at: 4_102_444_800 });
+  it("opens the disabled-backlog source filter when its Overview problem link is selected", async () => {
+    const disabledWithBacklog = sourceFixture({ id: "source-disabled", host: "paused.example.test", enabled: false, last_status: "disabled_source", pending_count: 2 });
+    const enabledWithBacklog = sourceFixture({ id: "source-enabled", host: "active.example.test", pending_count: 3 });
+    const disabledWithoutBacklog = sourceFixture({ id: "source-disabled-empty", host: "empty.example.test", enabled: false, last_status: "disabled_source", pending_count: 0, oldest_pending_at: null });
     const overview = {
       storage: { state: "normal", observed_db_size: 0, warning_threshold_bytes: 280 * 1_048_576, hard_stop_threshold_bytes: 300 * 1_048_576 },
-      pending: { active_count: 0, disabled_count: 0, oldest_age_seconds: null, by_status: { active: { pending: 0, leased: 0, retry_wait: 0, blocked: 0, failed: 0 }, disabled: { pending: 0, leased: 0, retry_wait: 0, blocked: 0, failed: 0 } } },
-      sources: { enabled_count: 2, disabled_count: 0, overdue_count: 1 },
+      pending: { active_count: 3, disabled_count: 2, oldest_age_seconds: 30, by_status: { active: { pending: 3, leased: 0, retry_wait: 0, blocked: 0, failed: 0 }, disabled: { pending: 2, leased: 0, retry_wait: 0, blocked: 0, failed: 0 } } },
+      sources: { enabled_count: 1, disabled_count: 2, overdue_count: 1 },
       runs_24h: { running: 0, succeeded: 0, partial: 0, failed: 0, blocked: 0, storage_limit: 0 },
       latest_run: null,
     };
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => String(input) === "/v1/sources"
-      ? jsonResponse({ sources: [overdueSource, futureSource] })
+      ? jsonResponse({ sources: [disabledWithBacklog, enabledWithBacklog, disabledWithoutBacklog] })
       : jsonResponse(overview));
     vi.stubGlobal("fetch", fetchMock);
 
     render(<AuthProvider><App /></AuthProvider>);
     fireEvent.change(screen.getByLabelText(/api token/i), { target: { value: "task-10-app-token" } });
     fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
-    fireEvent.click(await screen.findByRole("link", { name: /view overdue sources/i }));
+    fireEvent.click(await screen.findByRole("link", { name: /view disabled-backlog sources/i }));
 
-    expect(await screen.findByText("feed.example.test")).toBeTruthy();
-    expect(screen.queryByText("later.example.test")).toBeNull();
+    expect(await screen.findByText("paused.example.test")).toBeTruthy();
+    expect(screen.queryByText("active.example.test")).toBeNull();
+    expect(screen.queryByText("empty.example.test")).toBeNull();
     expect(window.location.pathname).toBe("/sources");
-    expect(window.location.search).toBe("?filter=overdue");
+    expect(window.location.search).toBe("?filter=backlog&enabled=disabled");
   });
 });

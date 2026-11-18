@@ -80,11 +80,16 @@ describe("Overview page", () => {
     expect(screen.getByText("4 blocked")).toBeTruthy();
     expect(screen.getByText("2 partial")).toBeTruthy();
     expect(screen.getByRole("link", { name: /view overdue sources/i }).getAttribute("href")).toBe("/sources?filter=overdue");
-    expect(screen.getByRole("link", { name: /view failed runs/i }).getAttribute("href")).toBe("/runs?status=failed");
-    expect(screen.getByRole("link", { name: /view blocked pending items/i }).getAttribute("href")).toBe("/errors?origin=pending&status=blocked");
+    expect(screen.getByRole("link", { name: /view backlog sources/i }).getAttribute("href")).toBe("/sources?filter=backlog");
+    expect(screen.getByRole("link", { name: /view disabled-backlog sources/i }).getAttribute("href")).toBe("/sources?filter=backlog&enabled=disabled");
+    expect(screen.queryByRole("link", { name: /view failed runs/i })).toBeNull();
+    expect(screen.queryByRole("link", { name: /view blocked pending items/i })).toBeNull();
+    expect(screen.queryByRole("link", { name: /view latest run/i })).toBeNull();
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/overview");
     fireEvent.click(screen.getByRole("link", { name: /view overdue sources/i }));
     expect(onNavigate).toHaveBeenCalledWith("/sources?filter=overdue");
+    fireEvent.click(screen.getByRole("link", { name: /view disabled-backlog sources/i }));
+    expect(onNavigate).toHaveBeenCalledWith("/sources?filter=backlog&enabled=disabled");
   });
 
   it("labels an application hard stop and offers clear empty states", async () => {
