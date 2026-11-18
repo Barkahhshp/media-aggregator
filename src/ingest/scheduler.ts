@@ -1,4 +1,7 @@
 import type { Env } from "../env";
+import { purgeExpiredOperatorActions } from "../audit/repository";
+import { mergeRunSourceSummaries, saveRunSourceSummaries } from "../runs/repository";
+import type { RunSourceStatus, RunSourceSummary } from "../runs/repository";
 import { getSource } from "../sources/repository";
 import type { Source } from "../sources/types";
 import { discoverHtmlList, discoverSource } from "./discovery";
@@ -13,7 +16,7 @@ import type { WriteReservation } from "./storage-guard";
 
 export const MAX_D1_QUERIES_PER_INVOCATION = 50;
 export const GLOBAL_LEASE_SECONDS = 60;
-const FINALIZATION_D1_QUERY_RESERVE = 5;
+const FINALIZATION_D1_QUERY_RESERVE = 6;
 const RUN_WRITE_RESERVATION_BYTES = 16 * 1024;
 const SOURCE_WRITE_RESERVATION_BYTES = 4 * 1024;
 const ARTICLE_FETCH_LIMIT = 2;
@@ -117,6 +120,39 @@ function scheduleResult(): ScheduleResult {
     errorCode: null,
     httpStatus: null,
   };
+}
+
+function sourceSummary(
+  sourceId: string,
+  status: RunSourceStatus,
+  httpStatus: number | null = null,
+  discoveredCount = 0,
+  storedCount = 0,
+  errorCode: string | null = null,
+  errorMessage: string | null = null,
+): RunSourceSummary {
+  return { sourceIdSnapshot: sourceId, status, httpStatus, discoveredCount, storedCount, errorCode, errorMessage };
+}
+
+function accumulateSourceSummary(summaries: Map<string, RunSourceSummary>, incoming: RunSourceSummary): void {
+  const current = summaries.get(incoming.sourceIdSnapshot);
+  summaries.set(incoming.sourceIdSnapshot, current === undefined
+    ? incoming
+    : mergeRunSourceSummaries(current, incoming));
+}
+
+function statusForUnhandledError(error: unknown): { status: RunSourceStatus; errorCode: string; errorMessage: string } {
+  const text = error instanceof Error ? error.message : "";
+  if (text.includes("storage_limit")) {
+    return { status: "storage_limit", errorCode: "storage_limit", errorMessage: "Ingestion stopped at the D1 storage threshold" };
+  }
+  if (text.includes("query_limit")) {
+    return { status: "failed", errorCode: "query_limit", errorMessage: "D1 query budget reached" };
+  }
+  if (text.includes("subrequest_limit")) {
+    return { status: "failed", errorCode: "subrequest_limit", errorMessage: "Worker subrequest budget reached" };
+  }
+  return { status: "failed", errorCode: "run_error", errorMessage: "Scheduled ingestion failed" };
 }
 
 function boundedConditionalHeader(value: string | null): string | null {
@@ -268,7 +304,7 @@ async function handleArticlePending(
   item: PendingItem,
   now: number,
   onRequest: () => void,
-): Promise<{ status: "stored" | "partial" | "blocked" | "storage_limit"; errorCode: string | null; httpStatus: number | null; committed?: boolean }> {
+): Promise<{ status: "stored" | "partial" | "blocked" | "storage_limit"; errorCode: string | null; httpStatus: number | null; committed?: boolean; discovered?: number }> {
   let response;
   try {
     response = await fetchPendingDocument(source, item, onRequest);
@@ -311,27 +347,27 @@ async function handleArticlePending(
       pendingSitemapLeaseToken: item.lease_token ?? undefined,
       pendingSitemapCursor: item.sitemap_cursor,
     });
-    if (discovery.stopReason === "storage_limit") return { status: "storage_limit", errorCode: "storage_limit", httpStatus: response.status };
+    if (discovery.stopReason === "storage_limit") return { status: "storage_limit", errorCode: "storage_limit", httpStatus: response.status, discovered: discovery.inserted };
     if (discovery.stopReason !== null && discovery.stopReason !== "max_candidates" && discovery.stopReason !== "query_limit") {
       await markPendingFailure(db, item, {
         kind: "retryable", nextAttemptAt: now + retryBackoff(item.attempts + 1),
         code: discovery.stopReason, message: "Sitemap discovery could not be fully accounted",
       });
-      return { status: "partial", errorCode: discovery.stopReason, httpStatus: response.status };
+      return { status: "partial", errorCode: discovery.stopReason, httpStatus: response.status, discovered: discovery.inserted };
     }
     if (discovery.hasMore) {
       await markPendingFailure(db, item, {
         kind: "retryable", nextAttemptAt: now + source.poll_interval_sec,
         code: "sitemap_page_remaining", message: "More sitemap entries remain for a later page",
       });
-      return { status: "partial", errorCode: "sitemap_page_remaining", httpStatus: response.status };
+      return { status: "partial", errorCode: "sitemap_page_remaining", httpStatus: response.status, discovered: discovery.inserted };
     }
     const completed = await db.prepare(`
       DELETE FROM pending_items
       WHERE id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?
     `).bind(item.id, item.lease_token, now).run();
-    if (completed.meta.changes === 0) return { status: "partial", errorCode: "lease_lost", httpStatus: response.status };
-    return { status: "stored", errorCode: null, httpStatus: response.status, committed: true };
+    if (completed.meta.changes === 0) return { status: "partial", errorCode: "lease_lost", httpStatus: response.status, discovered: discovery.inserted };
+    return { status: "stored", errorCode: null, httpStatus: response.status, committed: true, discovered: discovery.inserted };
   }
 
   const selectors = source.selectors ?? (source.kind === "feed" || source.kind === "sitemap"
@@ -389,14 +425,25 @@ async function handleSourceFetch(
   now: number,
   result: ScheduleResult,
   onRequest: () => void,
-): Promise<{ sourceId: string; errorMessage: string | null; httpStatus: number | null; sourceFetchKind: "feed" | "sitemap" | "none" }> {
+): Promise<{
+  sourceId: string;
+  status: RunSourceStatus;
+  httpStatus: number | null;
+  discovered: number;
+  stored: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+  sourceFetchKind: "feed" | "sitemap" | "none";
+}> {
   result.sourcesProcessed += 1;
+  const sourceFetchKind = source.kind === "sitemap" ? "sitemap" : source.kind === "article" ? "none" : "feed";
   const recordFailure = async (status: string, nextFetchAt: number) => {
     const recorded = await recordSourceStatus(db, source.id, now, status, false, nextFetchAt);
     if (!recorded) {
       result.status = "storage_limit";
       result.errorCode = "storage_limit";
     }
+    return recorded;
   };
   if (source.kind === "article") {
     const enqueued = await enqueueCandidates(db, source, [sourceCandidate(source)], {
@@ -408,12 +455,22 @@ async function handleSourceFetch(
     if (enqueued.stopReason === "storage_limit") {
       result.status = "storage_limit";
       result.errorCode = "storage_limit";
-      return { sourceId: source.id, errorMessage: "D1 storage limit reached while queueing a direct source", httpStatus: null, sourceFetchKind: "none" };
+      return {
+        sourceId: source.id, status: "storage_limit", httpStatus: null, discovered: enqueued.inserted, stored: 0,
+        errorCode: "storage_limit", errorMessage: "D1 storage limit reached while queueing a direct source", sourceFetchKind,
+      };
     }
     if (enqueued.stopReason !== null) {
       result.status = "partial";
       result.errorCode = enqueued.stopReason;
     }
+    let status: RunSourceStatus = enqueued.stopReason !== null || enqueued.hasMore
+      ? "partial"
+      : enqueued.blocked > 0 ? "blocked" : "succeeded";
+    let errorCode = enqueued.stopReason ?? (enqueued.hasMore ? "discovery_incomplete" : enqueued.blocked > 0 ? "blocked_candidate" : null);
+    let errorMessage = errorCode === null
+      ? null
+      : status === "blocked" ? "One or more discovered items were blocked by source policy" : "Source discovery could not be fully accounted";
     const sourceRecorded = await recordSourceSuccess(
       db,
       source,
@@ -425,8 +482,14 @@ async function handleSourceFetch(
     if (!sourceRecorded) {
       result.status = "storage_limit";
       result.errorCode = "storage_limit";
+      status = "storage_limit";
+      errorCode = "storage_limit";
+      errorMessage = "D1 storage limit reached while recording source status";
     }
-    return { sourceId: source.id, errorMessage: null, httpStatus: null, sourceFetchKind: "none" };
+    return {
+      sourceId: source.id, status, httpStatus: null, discovered: enqueued.inserted, stored: 0,
+      errorCode, errorMessage, sourceFetchKind,
+    };
   }
 
   result.sourceFetches += 1;
@@ -437,8 +500,17 @@ async function handleSourceFetch(
     const failure = getFailure(error);
     result.status = failure.code === "blocked_unsafe_url" ? "blocked" : "failed";
     result.errorCode = failure.code;
-    await recordFailure(failure.code, now + retryBackoff(source.consecutive_errors + 1));
-    return { sourceId: source.id, errorMessage: failure.message, httpStatus: null, sourceFetchKind: source.kind === "sitemap" ? "sitemap" : "feed" };
+    const recorded = await recordFailure(failure.code, now + retryBackoff(source.consecutive_errors + 1));
+    return {
+      sourceId: source.id,
+      status: recorded ? (failure.code === "blocked_unsafe_url" ? "blocked" : "failed") : "storage_limit",
+      httpStatus: null,
+      discovered: 0,
+      stored: 0,
+      errorCode: recorded ? failure.code : "storage_limit",
+      errorMessage: recorded ? failure.message : "D1 storage limit reached while recording source status",
+      sourceFetchKind,
+    };
   }
 
   if (response.status === 304) {
@@ -451,7 +523,11 @@ async function handleSourceFetch(
       result.status = "storage_limit";
       result.errorCode = "storage_limit";
     }
-    return { sourceId: source.id, errorMessage: null, httpStatus: 304, sourceFetchKind: source.kind === "sitemap" ? "sitemap" : "feed" };
+    return {
+      sourceId: source.id, status: recorded ? "not_modified" : "storage_limit", httpStatus: 304,
+      discovered: 0, stored: 0, errorCode: recorded ? null : "storage_limit",
+      errorMessage: recorded ? null : "D1 storage limit reached while recording source status", sourceFetchKind,
+    };
   }
   if (!isSuccessfulHttpStatus(response.status)) {
     const code = `http_${response.status}`;
@@ -460,8 +536,17 @@ async function handleSourceFetch(
     result.status = terminalHttpStatus(response.status) ? "blocked" : "failed";
     result.errorCode = code;
     const message = `Upstream returned HTTP ${response.status}`;
-    await recordFailure(code, retryAt ?? now + retryBackoff(source.consecutive_errors + 1));
-    return { sourceId: source.id, errorMessage: message, httpStatus: response.status, sourceFetchKind: source.kind === "sitemap" ? "sitemap" : "feed" };
+    const recorded = await recordFailure(code, retryAt ?? now + retryBackoff(source.consecutive_errors + 1));
+    return {
+      sourceId: source.id,
+      status: recorded ? (terminalHttpStatus(response.status) ? "blocked" : "failed") : "storage_limit",
+      httpStatus: response.status,
+      discovered: 0,
+      stored: 0,
+      errorCode: recorded ? code : "storage_limit",
+      errorMessage: recorded ? message : "D1 storage limit reached while recording source status",
+      sourceFetchKind,
+    };
   }
 
   try {
@@ -483,7 +568,10 @@ async function handleSourceFetch(
       result.errorCode ??= discovered.stopReason;
     }
     if (result.status === "storage_limit") {
-      return { sourceId: source.id, errorMessage: "D1 storage limit reached during source discovery", httpStatus: response.status, sourceFetchKind: source.kind === "sitemap" ? "sitemap" : "feed" };
+      return {
+        sourceId: source.id, status: "storage_limit", httpStatus: response.status, discovered: discovered.inserted,
+        stored: 0, errorCode: "storage_limit", errorMessage: "D1 storage limit reached during source discovery", sourceFetchKind,
+      };
     }
     const recorded = await recordSourceSuccess(db, source, now,
       boundedConditionalHeader(response.headers.get("ETag")),
@@ -493,13 +581,33 @@ async function handleSourceFetch(
       result.status = "storage_limit";
       result.errorCode = "storage_limit";
     }
-    return { sourceId: source.id, errorMessage: null, httpStatus: response.status, sourceFetchKind: source.kind === "sitemap" ? "sitemap" : "feed" };
+    if (!recorded) {
+      return {
+        sourceId: source.id, status: "storage_limit", httpStatus: response.status, discovered: discovered.inserted,
+        stored: 0, errorCode: "storage_limit", errorMessage: "D1 storage limit reached while recording source status", sourceFetchKind,
+      };
+    }
+    const status: RunSourceStatus = discovered.stopReason !== null || discovered.hasMore
+      ? "partial"
+      : discovered.blocked > 0 ? "blocked" : "succeeded";
+    const errorCode = discovered.stopReason ?? (discovered.hasMore ? "discovery_incomplete" : discovered.blocked > 0 ? "blocked_candidate" : null);
+    const errorMessage = errorCode === null
+      ? null
+      : status === "blocked" ? "One or more discovered items were blocked by source policy" : "Source discovery could not be fully accounted";
+    return {
+      sourceId: source.id, status, httpStatus: response.status, discovered: discovered.inserted, stored: 0,
+      errorCode, errorMessage, sourceFetchKind,
+    };
   } catch {
     result.status = "failed";
     result.errorCode = "parse_error";
     const message = "Source document could not be parsed";
-    await recordFailure("parse_error", now + retryBackoff(source.consecutive_errors + 1));
-    return { sourceId: source.id, errorMessage: message, httpStatus: response.status, sourceFetchKind: source.kind === "sitemap" ? "sitemap" : "feed" };
+    const recorded = await recordFailure("parse_error", now + retryBackoff(source.consecutive_errors + 1));
+    return {
+      sourceId: source.id, status: recorded ? "failed" : "storage_limit", httpStatus: response.status,
+      discovered: 0, stored: 0, errorCode: recorded ? "parse_error" : "storage_limit",
+      errorMessage: recorded ? message : "D1 storage limit reached while recording source status", sourceFetchKind,
+    };
   }
 }
 
@@ -509,7 +617,7 @@ async function processPendingItem(
   now: number,
   result: ScheduleResult,
   onRequest: () => void,
-): Promise<{ sourceId: string | null; errorMessage: string | null }> {
+): Promise<RunSourceSummary> {
   const source = await sourceForPending(db, item);
   if (source === null) {
     await markPendingFailure(db, item, {
@@ -517,16 +625,25 @@ async function processPendingItem(
     });
     result.status = "partial";
     result.errorCode ??= "source_missing";
-    return { sourceId: item.source_id, errorMessage: "Owning source no longer exists" };
+    return sourceSummary(item.source_id, "partial", null, 0, 0, "source_missing", "Owning source no longer exists");
   }
 
   const outcome = await handleArticlePending(db, source, item, now, onRequest);
   if (outcome.httpStatus !== null) result.httpStatus = outcome.httpStatus;
+  const discovered = outcome.discovered ?? 0;
+  result.discovered += discovered;
   if (outcome.committed === true && item.item_type === "article") result.stored += 1;
+  const stored = outcome.committed === true && item.item_type === "article" ? 1 : 0;
+  let status: RunSourceStatus = outcome.status === "stored" ? "succeeded" : outcome.status;
+  let errorCode = outcome.errorCode;
+  let errorMessage = errorCode === null ? null : `Pending item failed with ${errorCode}`;
   if (outcome.status === "storage_limit") {
     result.status = "storage_limit";
     result.errorCode = "storage_limit";
-    return { sourceId: source.id, errorMessage: "D1 storage limit reached while processing a pending item" };
+    status = "storage_limit";
+    errorCode = "storage_limit";
+    errorMessage = "D1 storage limit reached while processing a pending item";
+    return sourceSummary(source.id, status, outcome.httpStatus, discovered, stored, errorCode, errorMessage);
   }
   if (outcome.status === "blocked") {
     if (result.status === "succeeded") result.status = "blocked";
@@ -549,14 +666,13 @@ async function processPendingItem(
     if (!sourceWritten) {
       result.status = "storage_limit";
       result.errorCode = "storage_limit";
-      return { sourceId: source.id, errorMessage: "D1 storage limit reached while recording source status" };
+      status = "storage_limit";
+      errorCode = "storage_limit";
+      errorMessage = "D1 storage limit reached while recording source status";
     }
   }
 
-  return {
-    sourceId: source.id,
-    errorMessage: outcome.errorCode === null ? null : `Pending item failed with ${outcome.errorCode}`,
-  };
+  return sourceSummary(source.id, status, outcome.httpStatus, discovered, stored, errorCode, errorMessage);
 }
 
 export async function runScheduled(env: Env, scheduledTime: number): Promise<ScheduleResult> {
@@ -565,12 +681,14 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
   const scheduledAt = Math.floor(scheduledTime / 1000);
   const now = Math.floor(Date.now() / 1000);
   const result = scheduleResult();
+  const sourceSummaries = new Map<string, RunSourceSummary>();
   const runId = crypto.randomUUID();
   let runReservation: WriteReservation | null = null;
   let leaseToken: string | null = null;
   let leaseOwned = false;
   let runStarted = false;
   let sourceIdForRun: string | null = null;
+  let lastTouchedSourceId: string | null = null;
   let runErrorMessage: string | null = null;
 
   try {
@@ -609,6 +727,7 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
 
     await purgeExpiredTerminalItems(db, now);
     await purgeExpiredFetchRuns(db, now);
+    await purgeExpiredOperatorActions(db, now);
 
     await db.prepare(`
       INSERT INTO fetch_runs (id, started_at, status)
@@ -648,9 +767,12 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
         const item = await claimPending(db, now, crypto.randomUUID(), "article");
         if (item === null) break;
         result.articleFetches += 1;
+        lastTouchedSourceId = item.source_id;
         const outcome = await processPendingItem(db, item, now, result, budget.beforeFetch);
-        sourceIdForRun ??= outcome.sourceId;
+        accumulateSourceSummary(sourceSummaries, outcome);
+        sourceIdForRun ??= outcome.sourceIdSnapshot;
         runErrorMessage ??= outcome.errorMessage;
+        lastTouchedSourceId = null;
         if (result.status === "storage_limit" || result.errorCode === "subrequest_limit") break;
       }
     };
@@ -659,9 +781,12 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
       const sitemap = await claimPending(db, now, crypto.randomUUID(), "sitemap");
       if (sitemap !== null) {
         result.sitemapFetches = 1;
+        lastTouchedSourceId = sitemap.source_id;
         const outcome = await processPendingItem(db, sitemap, now, result, budget.beforeFetch);
-        sourceIdForRun ??= outcome.sourceId;
+        accumulateSourceSummary(sourceSummaries, outcome);
+        sourceIdForRun ??= outcome.sourceIdSnapshot;
         runErrorMessage ??= outcome.errorMessage;
+        lastTouchedSourceId = null;
       }
       if (result.errorCode !== "storage_limit") {
         await drainArticles(ARTICLE_FETCH_LIMIT);
@@ -683,9 +808,20 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
         if (due) dueSource = await getSource(db, due.id);
         if (dueSource !== null) {
           sourceIdForRun = dueSource.id;
+          lastTouchedSourceId = dueSource.id;
           const sourceResult = await handleSourceFetch(db, dueSource, now, result, budget.beforeFetch);
           runErrorMessage ??= sourceResult.errorMessage;
+          accumulateSourceSummary(sourceSummaries, sourceSummary(
+            sourceResult.sourceId,
+            sourceResult.status,
+            sourceResult.httpStatus,
+            sourceResult.discovered,
+            sourceResult.stored,
+            sourceResult.errorCode,
+            sourceResult.errorMessage,
+          ));
           if (sourceResult.sourceFetchKind === "sitemap") result.sitemapFetches += 1;
+          lastTouchedSourceId = null;
         }
         if (result.errorCode !== "storage_limit" && result.errorCode !== "subrequest_limit") {
           await drainArticles(ARTICLE_FETCH_LIMIT - result.articleFetches);
@@ -717,6 +853,18 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
     result.status = storageStopped ? "storage_limit" : "failed";
     result.errorCode = storageStopped ? "storage_limit" : queryStopped ? "query_limit" : requestStopped ? "subrequest_limit" : "run_error";
     runErrorMessage ??= message;
+    if (lastTouchedSourceId !== null) {
+      const sourceFailure = statusForUnhandledError(error);
+      accumulateSourceSummary(sourceSummaries, sourceSummary(
+        lastTouchedSourceId,
+        sourceFailure.status,
+        null,
+        0,
+        0,
+        sourceFailure.errorCode,
+        sourceFailure.errorMessage,
+      ));
+    }
   } finally {
     budget.beginFinalization();
     try {
@@ -733,6 +881,13 @@ export async function runScheduled(env: Env, scheduledTime: number): Promise<Sch
       // If D1 is unavailable, the run record and reservation expiry are best-effort.
     }
     if (runStarted) {
+      try {
+        await saveRunSourceSummaries(db, runId, [...sourceSummaries.values()]);
+      } catch {
+        result.status = result.status === "storage_limit" ? "storage_limit" : "failed";
+        result.errorCode ??= "run_log_error";
+        runErrorMessage ??= "Per-source run summaries could not be persisted";
+      }
       try {
         await saveRunResult(db, runId, sourceIdForRun, result, scheduledAt, Math.floor(Date.now() / 1000), runErrorMessage);
       } catch {

@@ -165,7 +165,10 @@ beforeEach(async () => {
   await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 describe("scheduled ingestion", () => {
   it("processes_pending_articles_before_one_due_feed_and_fetches_at_most_two_articles", async () => {
@@ -197,6 +200,138 @@ describe("scheduled ingestion", () => {
     expect(requests[2]).toContain("new-1");
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM articles").first()).toMatchObject({ count: 2 });
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM pending_items WHERE status IN ('pending', 'leased', 'retry_wait')").first()).toMatchObject({ count: 0 });
+  });
+
+  it("attributes_pending_and_due_source_outcomes_separately_without_changing_global_run_counts", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    const now = Math.floor(Date.now() / 1000);
+    const pendingSource = await makeSource("feed", "pending-owner", now + 999_999);
+    const dueSource = await makeSource("feed", "due-owner", now - 1);
+    await seedPending(pendingSource, 1);
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requests.push(url);
+      if (url === dueSource.url) {
+        return new Response(feed([{ id: "new-for-due", url: "https://example.com/new-for-due" }]), {
+          status: 200,
+          headers: { "Content-Type": "application/rss+xml" },
+        });
+      }
+      return new Response(htmlArticle(`Fetched ${url}`), { status: 200, headers: { "Content-Type": "text/html" } });
+    }));
+    const counted = countingDatabase(testEnv.DB);
+
+    const result = await scheduler.runScheduled({ ...testEnv, DB: counted.db }, now * 1000);
+
+    expect(result).toMatchObject({ status: "succeeded", sourceFetches: 1, articleFetches: 2, discovered: 1, stored: 2 });
+    expect(counted.queries() + requests.length).toBeLessThanOrEqual(50);
+    expect(result.d1Queries).toBe(counted.queries());
+    const global = await testEnv.DB.prepare("SELECT source_id, status, discovered_count, stored_count FROM fetch_runs")
+      .first<{ source_id: string | null; status: string; discovered_count: number; stored_count: number }>();
+    expect(global).toEqual({ source_id: dueSource.id, status: "succeeded", discovered_count: 1, stored_count: 2 });
+    const summaries = await testEnv.DB.prepare(`
+      SELECT source_id_snapshot, status, http_status, discovered_count, stored_count
+      FROM fetch_run_sources ORDER BY source_id_snapshot
+    `).all<{
+      source_id_snapshot: string;
+      status: string;
+      http_status: number | null;
+      discovered_count: number;
+      stored_count: number;
+    }>();
+    expect(summaries.results).toEqual([
+      { source_id_snapshot: dueSource.id, status: "succeeded", http_status: 200, discovered_count: 1, stored_count: 1 },
+      { source_id_snapshot: pendingSource.id, status: "succeeded", http_status: 200, discovered_count: 0, stored_count: 1 },
+    ]);
+  });
+
+  it("writes_a_not_modified_source_summary_for_http_304", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    const now = Math.floor(Date.now() / 1000);
+    const source = await makeSource("feed", "not-modified", now - 1);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 304, headers: { ETag: '"feed-v1"' } })));
+
+    await scheduler.runScheduled(testEnv, now * 1000);
+
+    const summary = await testEnv.DB.prepare(`
+      SELECT source_id_snapshot, status, http_status, discovered_count, stored_count
+      FROM fetch_run_sources WHERE source_id_snapshot = ?
+    `).bind(source.id).first();
+    expect(summary).toEqual({
+      source_id_snapshot: source.id,
+      status: "not_modified",
+      http_status: 304,
+      discovered_count: 0,
+      stored_count: 0,
+    });
+  });
+
+  it("merges_repeated_pending_outcomes_for_one_source_by_status_severity", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    const source = await makeSource("feed", "repeat-outcomes", Math.floor(Date.now() / 1000) + 999_999);
+    await seedPending(source, 2);
+    const statuses = [503, 403];
+    let requestIndex = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("upstream error", { status: statuses[requestIndex++] })));
+
+    const result = await scheduler.runScheduled(testEnv, Date.now());
+    const summaries = await testEnv.DB.prepare(`
+      SELECT source_id_snapshot, status, http_status, discovered_count, stored_count, error_code
+      FROM fetch_run_sources
+    `).all();
+
+    expect(result.status).toBe("partial");
+    expect(summaries.results).toEqual([{
+      source_id_snapshot: source.id,
+      status: "blocked",
+      http_status: 503,
+      discovered_count: 0,
+      stored_count: 0,
+      error_code: "http_403",
+    }]);
+  });
+
+  it("keeps_three_distinct_source_summaries_within_the_invocation_budget", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    const now = Math.floor(Date.now() / 1000);
+    const sitemapSource = await makeSource("sitemap", "budget-sitemap", now + 999_999);
+    const firstArticleSource = await makeSource("feed", "budget-first", now + 999_999);
+    const secondArticleSource = await makeSource("feed", "budget-second", now + 999_999);
+    await testEnv.DB.prepare(`
+      INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, next_attempt_at)
+      VALUES ('budget-sitemap-item', ?, 'sitemap', ?, ?, ?)
+    `).bind(sitemapSource.id, sitemapSource.url, sitemapSource.url, now).run();
+    await seedPending(firstArticleSource, 1);
+    await seedPending(secondArticleSource, 1);
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requests.push(url);
+      if (url === sitemapSource.url) {
+        return new Response("<urlset></urlset>", { status: 200, headers: { "Content-Type": "application/xml" } });
+      }
+      return new Response(htmlArticle(`Fetched ${url}`), { status: 200, headers: { "Content-Type": "text/html" } });
+    }));
+    const counted = countingDatabase(testEnv.DB);
+
+    const result = await scheduler.runScheduled({ ...testEnv, DB: counted.db }, now * 1000);
+    const summaries = await testEnv.DB.prepare("SELECT source_id_snapshot FROM fetch_run_sources ORDER BY source_id_snapshot")
+      .all<{ source_id_snapshot: string }>();
+
+    expect(result).toMatchObject({ articleFetches: 2, sitemapFetches: 1, stored: 2 });
+    expect(summaries.results.map((row) => row.source_id_snapshot)).toEqual([
+      firstArticleSource.id,
+      secondArticleSource.id,
+      sitemapSource.id,
+    ].sort());
+    expect(summaries.results).toHaveLength(3);
+    expect(counted.queries() + requests.length).toBeLessThanOrEqual(50);
+    expect(result.d1Queries).toBe(counted.queries());
   });
 
   it("defers_due_source_discovery_when_two_or_more_pending_items_are_already_eligible", async () => {
@@ -370,6 +505,26 @@ describe("scheduled ingestion", () => {
     expect(await testEnv.DB.prepare("SELECT id FROM fetch_runs WHERE id = 'old-run'").first()).toBeNull();
   });
 
+  it("purges_only_operator_actions_older_than_90_days_during_scheduled_cleanup", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    const executionSeconds = Math.floor(Date.now() / 1000);
+    await testEnv.DB.prepare(`
+      INSERT INTO operator_actions (id, created_at, action, target_type, target_id)
+      VALUES ('old-operator-action', ?, 'source.updated', 'source', 'source-old')
+    `).bind(executionSeconds - 90 * 24 * 60 * 60 - 1).run();
+    await testEnv.DB.prepare(`
+      INSERT INTO operator_actions (id, created_at, action, target_type, target_id)
+      VALUES ('recent-operator-action', ?, 'source.updated', 'source', 'source-recent')
+    `).bind(executionSeconds - 90 * 24 * 60 * 60 + 1).run();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unused")));
+
+    await scheduler.runScheduled(testEnv, 100_000);
+
+    const remaining = await testEnv.DB.prepare("SELECT id FROM operator_actions ORDER BY id").all<{ id: string }>();
+    expect(remaining.results).toEqual([{ id: "recent-operator-action" }]);
+  });
+
   it("keeps_a_sitemap_index_pending_when_more_child_sitemaps_remain_than_this_run_can_enqueue", async () => {
     const scheduler = await loadScheduler();
     if (!scheduler) return;
@@ -516,6 +671,8 @@ describe("scheduled ingestion", () => {
     expect(pending?.last_error).toContain("http_429");
     expect(await sourceState(source.id)).toMatchObject({ last_status: "http_429", consecutive_errors: 1, last_fetched_at: now });
     expect(await runs()).toMatchObject([{ status: "partial", http_status: 429, error_code: "http_429" }]);
+    expect(await testEnv.DB.prepare("SELECT status, http_status, error_code FROM fetch_run_sources WHERE source_id_snapshot = ?")
+      .bind(source.id).first()).toEqual({ status: "partial", http_status: 429, error_code: "http_429" });
   });
 
   it("marks_definitive_article_403_as_blocked_in_pending_source_and_fetch_run", async () => {
@@ -534,6 +691,8 @@ describe("scheduled ingestion", () => {
     expect(pending).toMatchObject({ status: "blocked" });
     expect(await sourceState(source.id)).toMatchObject({ last_status: "http_403" });
     expect(await runs()).toMatchObject([{ status: "blocked", http_status: 403, error_code: "http_403" }]);
+    expect(await testEnv.DB.prepare("SELECT status, http_status, error_code FROM fetch_run_sources WHERE source_id_snapshot = ?")
+      .bind(source.id).first()).toEqual({ status: "blocked", http_status: 403, error_code: "http_403" });
   });
 
   it("records_parse_errors_in_both_source_and_fetch_run_status", async () => {
@@ -549,6 +708,8 @@ describe("scheduled ingestion", () => {
     expect(result.errorCode).toBe("parse_error");
     expect(await sourceState(source.id)).toMatchObject({ last_status: "parse_error", consecutive_errors: 1, last_fetched_at: now });
     expect(await runs()).toMatchObject([{ status: "failed", http_status: 200, error_code: "parse_error" }]);
+    expect(await testEnv.DB.prepare("SELECT status, http_status, error_code FROM fetch_run_sources WHERE source_id_snapshot = ?")
+      .bind(source.id).first()).toEqual({ status: "failed", http_status: 200, error_code: "parse_error" });
   });
 
   it("stops_ingestion_at_the_physical_storage_gate_before_a_source_or_article_fetch", async () => {
