@@ -66,6 +66,19 @@ describe("Errors page", () => {
     expect(screen.queryByRole("button", { name: /retry item|purge|edit pending/i })).toBeNull();
   });
 
+  it("renders an out-of-range sample timestamp without crashing", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), window.location.origin);
+      if (url.pathname === "/v1/sources") return jsonResponse({ sources: [] });
+      if (url.pathname === "/v1/errors") return jsonResponse({ errors: [groupFixture({ samples: [{ time: 1e100, message: "Malformed timestamp sample" }] })], next_cursor: null });
+      throw new Error(`Unexpected request: ${url.pathname}`);
+    }));
+
+    render(<ErrorsPage session={createSession()} />);
+    expect(await screen.findByText("Malformed timestamp sample")).toBeTruthy();
+    expect(screen.getByText("Time unavailable").tagName).toBe("TIME");
+  });
+
   it("drills into pending items with whitelisted status and source filters only", async () => {
     const requests: URL[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {

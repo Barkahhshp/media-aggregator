@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import type { TokenSession } from "../auth/AuthProvider";
 import { apiRequest } from "../api/client";
+import { safeApiErrorMessage } from "../api/safe-error";
 import { LoadingError } from "../components/LoadingError";
 import { StatusBadge } from "../components/StatusBadge";
 
@@ -102,10 +103,7 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 function apiMessage(payload: unknown, status: number): string {
-  if (isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === "string" && payload.error.message.length > 0) {
-    return payload.error.message;
-  }
-  return `Run request failed (HTTP ${status})`;
+  return safeApiErrorMessage(payload, status, "Run");
 }
 
 function timeLabel(seconds: number | null): string {

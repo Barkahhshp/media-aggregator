@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import type { TokenSession } from "../auth/AuthProvider";
 import { apiRequest } from "../api/client";
+import { safeApiErrorMessage } from "../api/safe-error";
 import { LoadingError } from "../components/LoadingError";
 import { StatusBadge } from "../components/StatusBadge";
 
@@ -105,16 +106,19 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 function apiMessage(payload: unknown, status: number): string {
-  if (isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === "string" && payload.error.message.length > 0) {
-    return payload.error.message;
-  }
-  return `Error request failed (HTTP ${status})`;
+  return safeApiErrorMessage(payload, status, "Error");
 }
 
 function timeLabel(seconds: number): string {
   if (!Number.isFinite(seconds)) return "Time unavailable";
   const date = new Date(seconds * 1_000);
   return Number.isNaN(date.getTime()) ? "Time unavailable" : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+
+function dateTimeValue(seconds: number): string | undefined {
+  if (!Number.isFinite(seconds)) return undefined;
+  const date = new Date(seconds * 1_000);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
 function groupKey(group: ErrorGroup): string {
@@ -309,7 +313,7 @@ export function ErrorsPage({ session }: ErrorsPageProps) {
                       <div><dt>First seen</dt><dd>{timeLabel(group.first_time)}</dd></div>
                       <div><dt>Last seen</dt><dd>{timeLabel(group.last_time)}</dd></div>
                     </dl>
-                    {group.samples.length > 0 && <div className="error-samples"><h4>Recent samples</h4><ul>{group.samples.map((sample, index) => <li key={`${sample.time}-${index}`}><time dateTime={new Date(sample.time * 1_000).toISOString()}>{timeLabel(sample.time)}</time><p>{sample.message ?? "No message available."}</p></li>)}</ul></div>}
+                    {group.samples.length > 0 && <div className="error-samples"><h4>Recent samples</h4><ul>{group.samples.map((sample, index) => <li key={`${sample.time}-${index}`}><time dateTime={dateTimeValue(sample.time)}>{timeLabel(sample.time)}</time><p>{sample.message ?? "No message available."}</p></li>)}</ul></div>}
                     {canDrillDown(group) && <button className="secondary-button pending-drilldown-toggle" type="button" aria-expanded={expanded} onClick={() => togglePending(group)}>{expanded ? "Hide matching pending items" : "Show matching pending items"}</button>}
                     {group.origin === "pending" && !canDrillDown(group) && <p className="pending-drilldown-note">This status is not available in the safe pending-item list.</p>}
                     {expanded && canDrillDown(group) && (
