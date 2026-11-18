@@ -33,7 +33,6 @@ export function decodePendingCursor(token: string): PendingCursor {
   return { discoveredAt: row.discovered_at, id: row.id };
 }
 
-interface ErrorRow { origin: string; source_id: string; code: string | null; status: string; event_time: number; message: string | null; }
 interface GroupRow { origin: string; source_id: string; code: string; status: string; count: number; first_time: number; last_time: number; samples: string; }
 export interface ErrorGroup { origin: string; source_id: string; code: string; status: string; count: number; first_time: number; last_time: number; samples: Array<{ time: number; message: string | null }> }
 

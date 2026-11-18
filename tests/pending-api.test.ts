@@ -12,6 +12,13 @@ async function loadApp() { const moduleLoader = appModules["../src/app.ts"]; exp
 async function request(app: App, path: string, authenticated = true) { return app.request(path, { headers: authenticated ? { Authorization: `Bearer ${testEnv.API_TOKEN}` } : undefined }, testEnv); }
 const now = Math.floor(Date.now() / 1000);
 
+function hasControlCharacters(value: string | null | undefined): boolean {
+  return [...(value ?? "")].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
+  });
+}
+
 beforeEach(async () => {
   await reset(); await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);
   await testEnv.DB.prepare("INSERT INTO sources (id, url, kind, host) VALUES ('source-a', 'https://example.com/a', 'feed', 'example.com'), ('source-b', 'https://example.com/b', 'feed', 'example.com')").run();
@@ -54,7 +61,9 @@ describe("pending API", () => {
     const secondPayload = await second.json<{ pending: Array<{ id: string; error_code: string | null; error_message: string | null }> }>();
     expect(secondPayload.pending.map((row) => row.id)).toEqual(["retry-a", "pending-a"]);
     expect(secondPayload.pending.find((row) => row.id === "retry-a")).toMatchObject({ error_code: "fetch_error" });
-    expect(secondPayload.pending.find((row) => row.id === "retry-a")?.error_message).not.toMatch(/https?:\/\/|[\u0000-\u001f]|token=secret/i);
+    const retryMessage = secondPayload.pending.find((row) => row.id === "retry-a")?.error_message;
+    expect(retryMessage).not.toMatch(/https?:\/\/|token=secret/i);
+    expect(hasControlCharacters(retryMessage)).toBe(false);
     const blocked = await request(app, "/v1/pending?status=blocked");
     expect((await blocked.json<{ pending: Array<{ error_code: string }> }>()).pending[0]?.error_code).toBe("unknown_error");
     for (const row of firstPayload.pending) for (const forbidden of ["lease_token", "dedupe_key", "canonical_url", "sitemap_cursor", "last_error"]) expect(row).not.toHaveProperty(forbidden);

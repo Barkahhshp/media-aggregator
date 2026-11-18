@@ -1,6 +1,6 @@
 import { applyD1Migrations, reset } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
 
 interface TestEnvironment {
@@ -44,7 +44,16 @@ async function runRequest(
   return await app.request(path, { headers }, testEnv);
 }
 
+function hasControlCharacters(value: string | null | undefined): boolean {
+  return [...(value ?? "")].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
+  });
+}
+
 const now = Math.floor(Date.now() / 1000);
+
+afterEach(() => vi.useRealTimers());
 
 async function seedRuns(): Promise<void> {
   const source = (id: string) => testEnv.DB.prepare(`
@@ -99,6 +108,8 @@ describe("run history API", () => {
   });
 
   it("lists the last 30 days by stable started_at/id order with default and maximum limits", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now * 1000);
     const app = await loadApp();
     if (!app) return;
     const response = await runRequest(app, "/v1/runs");
@@ -168,7 +179,7 @@ describe("run history API", () => {
     const listed = (await list.json<{ runs: Array<{ id: string; error_code: string | null; error_message: string | null }> }>()).runs
       .find((run) => run.id === "run-malformed-errors");
     expect(listed).toMatchObject({ id: "run-malformed-errors", error_code: "unknown_error" });
-    expect(listed?.error_message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    expect(hasControlCharacters(listed?.error_message)).toBe(false);
     expect(listed?.error_message).not.toContain("https://");
     expect(listed?.error_message).not.toContain("Bearer top-secret");
     expect(listed?.error_message).toHaveLength(1024);
@@ -176,10 +187,10 @@ describe("run history API", () => {
     const detail = await runRequest(app, "/v1/runs/run-malformed-errors");
     const detailPayload = await detail.json<{ run: { error_code: string | null; error_message: string | null }; sources: Array<{ error_code: string | null; error_message: string | null }> }>();
     expect(detailPayload.run.error_code).toBe("unknown_error");
-    expect(detailPayload.run.error_message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    expect(hasControlCharacters(detailPayload.run.error_message)).toBe(false);
     expect(detailPayload.run.error_message).toHaveLength(1024);
     expect(detailPayload.sources[0]?.error_code).toBe("unknown_error");
-    expect(detailPayload.sources[0]?.error_message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    expect(hasControlCharacters(detailPayload.sources[0]?.error_message)).toBe(false);
     expect(detailPayload.sources[0]?.error_message).toHaveLength(1024);
   });
 
