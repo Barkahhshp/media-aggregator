@@ -4,6 +4,8 @@ const MAX_ERROR_MESSAGE_BYTES = 1024;
 const MAX_RUN_SOURCE_COUNT = 1_000;
 
 export const MAX_RUN_SOURCE_SUMMARIES_PER_RUN = 3;
+export const RUN_STATUSES = ["running", "succeeded", "partial", "failed", "blocked", "storage_limit"] as const;
+export type RunStatus = typeof RUN_STATUSES[number];
 
 export type RunSourceStatus =
   | "succeeded"
@@ -107,11 +109,7 @@ function selectHttpStatus(left: number | null, right: number | null): number | n
 
 function errorCandidate(summary: RunSourceSummary): { status: RunSourceStatus; code: string; message: string | null } | null {
   if (summary.errorCode === null && summary.errorMessage === null) return null;
-  return {
-    status: summary.status,
-    code: summary.errorCode ?? "unknown_error",
-    message: summary.errorMessage,
-  };
+  return { status: summary.status, code: summary.errorCode ?? "unknown_error", message: summary.errorMessage };
 }
 
 function selectError(left: RunSourceSummary, right: RunSourceSummary): { errorCode: string | null; errorMessage: string | null } {
@@ -123,80 +121,69 @@ function selectError(left: RunSourceSummary, right: RunSourceSummary): { errorCo
   const rightPriority = STATUS_PRIORITY[rightError.status];
   const leftKey = `${leftError.code}\u0000${leftError.message ?? ""}`;
   const rightKey = `${rightError.code}\u0000${rightError.message ?? ""}`;
-  const selected = rightPriority > leftPriority || (rightPriority === leftPriority && rightKey < leftKey)
-    ? rightError
-    : leftError;
+  const selected = rightPriority > leftPriority || (rightPriority === leftPriority && rightKey < leftKey) ? rightError : leftError;
   return { errorCode: selected.code === "unknown_error" && selected.status !== "failed" ? null : selected.code, errorMessage: selected.message };
 }
 
-/** Merge repeated work on one source without depending on scheduler call order. */
 export function mergeRunSourceSummaries(left: RunSourceSummary, right: RunSourceSummary): RunSourceSummary {
-  if (left.sourceIdSnapshot !== right.sourceIdSnapshot) {
-    throw new TypeError("Cannot merge summaries for different source IDs");
-  }
+  if (left.sourceIdSnapshot !== right.sourceIdSnapshot) throw new TypeError("Cannot merge summaries for different source IDs");
   const status = STATUS_PRIORITY[right.status] > STATUS_PRIORITY[left.status] ? right.status : left.status;
   const errors = selectError(left, right);
-  return {
-    sourceIdSnapshot: left.sourceIdSnapshot,
-    status,
-    httpStatus: selectHttpStatus(left.httpStatus, right.httpStatus),
-    discoveredCount: assertCount(left.discoveredCount + right.discoveredCount, "discoveredCount"),
-    storedCount: assertCount(left.storedCount + right.storedCount, "storedCount"),
-    errorCode: errors.errorCode,
-    errorMessage: errors.errorMessage,
-  };
+  return { sourceIdSnapshot: left.sourceIdSnapshot, status, httpStatus: selectHttpStatus(left.httpStatus, right.httpStatus), discoveredCount: assertCount(left.discoveredCount + right.discoveredCount, "discoveredCount"), storedCount: assertCount(left.storedCount + right.storedCount, "storedCount"), errorCode: errors.errorCode, errorMessage: errors.errorMessage };
 }
 
 function normalizeSummary(summary: RunSourceSummary): RunSourceSummary {
-  if (byteLength(summary.sourceIdSnapshot) < 1 || byteLength(summary.sourceIdSnapshot) > MAX_SOURCE_ID_BYTES) {
-    throw new RangeError("sourceIdSnapshot must be between 1 and 128 UTF-8 bytes");
-  }
+  if (byteLength(summary.sourceIdSnapshot) < 1 || byteLength(summary.sourceIdSnapshot) > MAX_SOURCE_ID_BYTES) throw new RangeError("sourceIdSnapshot must be between 1 and 128 UTF-8 bytes");
   if (!VALID_STATUSES.has(summary.status)) throw new TypeError("Invalid per-source run status");
-  if (summary.httpStatus !== null && (!Number.isInteger(summary.httpStatus) || summary.httpStatus < 100 || summary.httpStatus > 599)) {
-    throw new RangeError("httpStatus must be null or an HTTP status between 100 and 599");
-  }
+  if (summary.httpStatus !== null && (!Number.isInteger(summary.httpStatus) || summary.httpStatus < 100 || summary.httpStatus > 599)) throw new RangeError("httpStatus must be null or an HTTP status between 100 and 599");
   assertCount(summary.discoveredCount, "discoveredCount");
   assertCount(summary.storedCount, "storedCount");
-  return {
-    ...summary,
-    errorCode: sanitizeErrorCode(summary.errorCode),
-    errorMessage: sanitizeErrorMessage(summary.errorMessage),
-  };
+  return { ...summary, errorCode: sanitizeErrorCode(summary.errorCode), errorMessage: sanitizeErrorMessage(summary.errorMessage) };
 }
 
-/** Persist at most one row per source in a single bounded D1 statement. */
-export async function saveRunSourceSummaries(
-  db: D1Database,
-  runId: string,
-  summaries: RunSourceSummary[],
-): Promise<void> {
+export async function saveRunSourceSummaries(db: D1Database, runId: string, summaries: RunSourceSummary[]): Promise<void> {
   if (summaries.length === 0) return;
-  if (summaries.length > MAX_RUN_SOURCE_SUMMARIES_PER_RUN) {
-    throw new RangeError(`A run may persist at most ${MAX_RUN_SOURCE_SUMMARIES_PER_RUN} per-source summaries`);
-  }
-  if (byteLength(runId) < 1 || byteLength(runId) > MAX_SOURCE_ID_BYTES) {
-    throw new RangeError("runId must be between 1 and 128 UTF-8 bytes");
-  }
+  if (summaries.length > MAX_RUN_SOURCE_SUMMARIES_PER_RUN) throw new RangeError(`A run may persist at most ${MAX_RUN_SOURCE_SUMMARIES_PER_RUN} per-source summaries`);
+  if (byteLength(runId) < 1 || byteLength(runId) > MAX_SOURCE_ID_BYTES) throw new RangeError("runId must be between 1 and 128 UTF-8 bytes");
   const uniqueIds = new Set(summaries.map((summary) => summary.sourceIdSnapshot));
   if (uniqueIds.size !== summaries.length) throw new TypeError("Per-source summaries must have unique source IDs");
-
   const normalized = summaries.map(normalizeSummary);
   const valuesSql = normalized.map(() => "(?, ?, (SELECT id FROM sources WHERE id = ?), ?, ?, ?, ?, ?, ?)").join(", ");
-  const bindings = normalized.flatMap((summary) => [
-    runId,
-    summary.sourceIdSnapshot,
-    summary.sourceIdSnapshot,
-    summary.status,
-    summary.httpStatus,
-    summary.discoveredCount,
-    summary.storedCount,
-    summary.errorCode,
-    summary.errorMessage,
-  ]);
-  await db.prepare(`
-    INSERT INTO fetch_run_sources (
-      run_id, source_id_snapshot, source_id, status, http_status,
-      discovered_count, stored_count, error_code, error_message
-    ) VALUES ${valuesSql}
-  `).bind(...bindings).run();
+  const bindings = normalized.flatMap((summary) => [runId, summary.sourceIdSnapshot, summary.sourceIdSnapshot, summary.status, summary.httpStatus, summary.discoveredCount, summary.storedCount, summary.errorCode, summary.errorMessage]);
+  await db.prepare(`INSERT INTO fetch_run_sources (run_id, source_id_snapshot, source_id, status, http_status, discovered_count, stored_count, error_code, error_message) VALUES ${valuesSql}`).bind(...bindings).run();
+}
+
+export interface RunCursor { startedAt: number; id: string }
+export class InvalidRunCursorError extends Error { constructor() { super("Invalid run cursor"); this.name = "InvalidRunCursorError"; } }
+
+function encodeBase64Url(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+}
+
+function decodeBase64Url(token: string): string {
+  if (token.length === 0 || token.length > 1024 || !/^[A-Za-z0-9_-]+$/u.test(token)) throw new InvalidRunCursorError();
+  try {
+    const base64 = token.replace(/-/gu, "+").replace(/_/gu, "/");
+    const binary = atob(base64 + "=".repeat((4 - (base64.length % 4)) % 4));
+    return new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(binary, (character) => character.charCodeAt(0)));
+  } catch { throw new InvalidRunCursorError(); }
+}
+
+export function encodeRunCursor(value: RunCursor): string {
+  if (!Number.isSafeInteger(value.startedAt) || value.startedAt < 0 || value.id.length === 0 || value.id.length > 128) throw new InvalidRunCursorError();
+  return encodeBase64Url(JSON.stringify({ v: 1, started_at: value.startedAt, id: value.id }));
+}
+
+export function decodeRunCursor(token: string): RunCursor {
+  let parsed: unknown;
+  try { parsed = JSON.parse(decodeBase64Url(token)) as unknown; } catch { throw new InvalidRunCursorError(); }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new InvalidRunCursorError();
+  const value = parsed as Record<string, unknown>;
+  if (value.v !== 1 || typeof value.started_at !== "number" || typeof value.id !== "string") throw new InvalidRunCursorError();
+  const cursor = { startedAt: value.started_at, id: value.id };
+  if (!Number.isSafeInteger(cursor.startedAt) || cursor.startedAt < 0 || cursor.id.length === 0 || cursor.id.length > 128) throw new InvalidRunCursorError();
+  return cursor;
 }

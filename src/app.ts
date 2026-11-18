@@ -6,6 +6,7 @@ import { sources } from "./routes/sources";
 import { articles } from "./routes/articles";
 import { exports } from "./routes/exports";
 import { status } from "./routes/status";
+import { runs } from "./routes/runs";
 
 function withNoStore(response: Response): Response {
   response.headers.set("Cache-Control", "no-store");
@@ -44,6 +45,7 @@ export function createApp(): Hono<{ Bindings: Env }> {
   app.route("/", articles);
   app.route("/", exports);
   app.route("/", status);
+  app.route("/", runs);
   app.onError((_error, context) => {
     const response = context.json(
       {
