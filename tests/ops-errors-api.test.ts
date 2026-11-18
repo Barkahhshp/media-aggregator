@@ -27,6 +27,34 @@ beforeEach(async () => {
 });
 
 describe("errors API", () => {
+  it("normalizes unsafe error codes before grouping and returning them", async () => {
+    const app = await loadApp(); if (!app) return;
+    await testEnv.DB.batch([
+      testEnv.DB.prepare("INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, status, discovered_at, terminal_expires_at, last_error_code, last_error) VALUES ('pending-unsafe-a', 'source-a', 'article', 'unsafe-a', 'https://secret.example/unsafe-a', 'failed', ?, ?, 'Bearer secret-token', 'unsafe code')").bind(now - 4, now + 3600),
+      testEnv.DB.prepare("INSERT INTO pending_items (id, source_id, item_type, dedupe_key, canonical_url, status, discovered_at, terminal_expires_at, last_error_code, last_error) VALUES ('pending-unsafe-b', 'source-a', 'article', 'unsafe-b', 'https://secret.example/unsafe-b', 'failed', ?, ?, 'NOT A SAFE CODE', 'unsafe code')").bind(now - 3, now + 3600),
+    ]);
+    const response = await request(app, "/v1/errors?source_id=source-a");
+    expect(response.status).toBe(200);
+    const payload = await response.json<{ errors: Array<{ origin: string; source_id: string; code: string; status: string; count: number }> }>();
+    const unsafeGroup = payload.errors.find((group) => group.origin === "pending" && group.source_id === "source-a" && group.status === "failed" && group.code === "unknown_error");
+    expect(unsafeGroup).toEqual(expect.objectContaining({ count: 2 }));
+    expect(payload.errors.some((group) => group.code.includes("Bearer") || group.code.includes(" "))).toBe(false);
+  });
+
+  it("does not expose run errors older than the 30-day retention window", async () => {
+    const app = await loadApp(); if (!app) return;
+    await testEnv.DB.batch([
+      testEnv.DB.prepare("INSERT INTO fetch_runs (id, source_id, started_at, status) VALUES ('run-old', 'source-b', ?, 'partial')").bind(now - (31 * 24 * 60 * 60)),
+      testEnv.DB.prepare("INSERT INTO fetch_run_sources (run_id, source_id_snapshot, source_id, status, error_code, error_message) VALUES ('run-old', 'source-b', 'source-b', 'partial', 'fetch_error', 'old run failure')"),
+    ]);
+    const response = await request(app, "/v1/errors?source_id=source-b");
+    expect(response.status).toBe(200);
+    const payload = await response.json<{ errors: Array<{ origin: string; source_id: string; code: string; status: string; count: number; first_time: number; last_time: number }> }>();
+    expect(payload.errors).toEqual([
+      expect.objectContaining({ origin: "run", source_id: "source-b", code: "fetch_error", status: "partial", count: 1, first_time: now - 20, last_time: now - 20 }),
+    ]);
+  });
+
   it("requires auth, is no-store, separates origins, aggregates bounds and bounded samples", async () => {
     const app = await loadApp(); if (!app) return;
     expect((await request(app, "/v1/errors", false)).status).toBe(401);

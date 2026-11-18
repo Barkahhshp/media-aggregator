@@ -45,13 +45,24 @@ export async function listErrorGroups(db: D1Database, limit: number, sourceId?: 
   if (cursor !== undefined) bindings.push(cursor.origin, cursor.origin, cursor.sourceId, cursor.origin, cursor.sourceId, cursor.code, cursor.origin, cursor.sourceId, cursor.code, cursor.status);
   bindings.push(limit);
   const result = await db.prepare(`WITH events AS (
-    SELECT 'run' AS origin, fetch_run_sources.source_id_snapshot AS source_id, COALESCE(fetch_run_sources.error_code, 'unknown_error') AS code, fetch_run_sources.status, fetch_runs.started_at AS event_time, fetch_run_sources.error_message AS message
+    SELECT 'run' AS origin, fetch_run_sources.source_id_snapshot AS source_id, fetch_run_sources.error_code AS raw_code, fetch_run_sources.status, fetch_runs.started_at AS event_time, fetch_run_sources.error_message AS message
     FROM fetch_run_sources JOIN fetch_runs ON fetch_runs.id = fetch_run_sources.run_id
-    WHERE (fetch_run_sources.error_code IS NOT NULL OR fetch_run_sources.error_message IS NOT NULL) AND (? IS NULL OR fetch_run_sources.source_id_snapshot = ?)
+    WHERE (fetch_run_sources.error_code IS NOT NULL OR fetch_run_sources.error_message IS NOT NULL) AND fetch_runs.started_at >= unixepoch() - (30 * 24 * 60 * 60) AND (? IS NULL OR fetch_run_sources.source_id_snapshot = ?)
     UNION ALL
-    SELECT 'pending' AS origin, source_id, COALESCE(last_error_code, 'unknown_error') AS code, status, discovered_at AS event_time, last_error AS message
+    SELECT 'pending' AS origin, source_id, last_error_code AS raw_code, status, discovered_at AS event_time, last_error AS message
     FROM pending_items WHERE (last_error_code IS NOT NULL OR last_error IS NOT NULL) AND (? IS NULL OR source_id = ?)
-  ), filtered AS (SELECT * FROM events ${sourcePredicate ? "WHERE source_id = ?" : ""}), ranked AS (
+  ), normalized AS (
+    SELECT origin, source_id,
+      CASE
+        WHEN lower(trim(COALESCE(raw_code, ''))) GLOB '[a-z]*'
+          AND lower(trim(COALESCE(raw_code, ''))) NOT GLOB '*[^a-z0-9_.-]*'
+          AND length(lower(trim(COALESCE(raw_code, '')))) BETWEEN 1 AND 128
+        THEN lower(trim(raw_code))
+        ELSE 'unknown_error'
+      END AS code,
+      status, event_time, message
+    FROM events
+  ), filtered AS (SELECT * FROM normalized ${sourcePredicate ? "WHERE source_id = ?" : ""}), ranked AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY origin, source_id, code, status ORDER BY event_time DESC) AS sample_rank
     FROM filtered
   ), grouped AS (
