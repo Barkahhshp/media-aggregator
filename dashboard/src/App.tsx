@@ -4,6 +4,8 @@ import { useAuth } from "./auth/AuthProvider";
 import { OverviewPage } from "./pages/OverviewPage";
 import { SourcesPage } from "./pages/SourcesPage";
 import { ArticlesPage } from "./pages/ArticlesPage";
+import { RunsPage } from "./pages/RunsPage";
+import { ErrorsPage } from "./pages/ErrorsPage";
 
 function currentLocation(): string {
   return `${window.location.pathname}${window.location.search}`;
@@ -71,6 +73,8 @@ export function App() {
   const isOverview = pathname === "/" || pathname === "/overview";
   const isSources = pathname === "/sources";
   const isArticles = pathname === "/articles";
+  const isRuns = pathname === "/runs";
+  const isErrors = pathname === "/errors";
 
   return (
     <main className="dashboard-shell">
@@ -88,6 +92,8 @@ export function App() {
         <a href="/overview" aria-current={isOverview ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/overview"); }}>Overview</a>
         <a href="/sources" aria-current={isSources ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/sources"); }}>Sources</a>
         <a href="/articles" aria-current={isArticles ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/articles"); }}>Articles/Feed</a>
+        <a href="/runs" aria-current={isRuns ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/runs"); }}>Runs</a>
+        <a href="/errors" aria-current={isErrors ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/errors"); }}>Errors</a>
       </nav>
       {isOverview ? (
         <OverviewPage session={session} onNavigate={navigate} />
@@ -95,6 +101,10 @@ export function App() {
         <SourcesPage session={session} onNavigate={navigate} />
       ) : isArticles ? (
         <ArticlesPage session={session} />
+      ) : isRuns ? (
+        <RunsPage session={session} />
+      ) : isErrors ? (
+        <ErrorsPage session={session} />
       ) : (
         <section className="future-view empty-state" aria-live="polite">
           <p className="eyebrow">Filtered view</p>
