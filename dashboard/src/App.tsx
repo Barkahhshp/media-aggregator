@@ -6,6 +6,7 @@ import { SourcesPage } from "./pages/SourcesPage";
 import { ArticlesPage } from "./pages/ArticlesPage";
 import { RunsPage } from "./pages/RunsPage";
 import { ErrorsPage } from "./pages/ErrorsPage";
+import { ExportsPage } from "./pages/ExportsPage";
 
 function currentLocation(): string {
   return `${window.location.pathname}${window.location.search}`;
@@ -75,6 +76,7 @@ export function App() {
   const isArticles = pathname === "/articles";
   const isRuns = pathname === "/runs";
   const isErrors = pathname === "/errors";
+  const isExports = pathname === "/exports";
 
   return (
     <main className="dashboard-shell">
@@ -94,6 +96,7 @@ export function App() {
         <a href="/articles" aria-current={isArticles ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/articles"); }}>Articles/Feed</a>
         <a href="/runs" aria-current={isRuns ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/runs"); }}>Runs</a>
         <a href="/errors" aria-current={isErrors ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/errors"); }}>Errors</a>
+        <a href="/exports" aria-current={isExports ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/exports"); }}>Exports and Backups</a>
       </nav>
       {isOverview ? (
         <OverviewPage session={session} onNavigate={navigate} />
@@ -105,6 +108,8 @@ export function App() {
         <RunsPage session={session} />
       ) : isErrors ? (
         <ErrorsPage session={session} />
+      ) : isExports ? (
+        <ExportsPage session={session} />
       ) : (
         <section className="future-view empty-state" aria-live="polite">
           <p className="eyebrow">Filtered view</p>
