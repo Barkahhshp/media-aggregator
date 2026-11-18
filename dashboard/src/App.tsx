@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { useAuth } from "./auth/AuthProvider";
 import { OverviewPage } from "./pages/OverviewPage";
 import { SourcesPage } from "./pages/SourcesPage";
+import { ArticlesPage } from "./pages/ArticlesPage";
 
 function currentLocation(): string {
   return `${window.location.pathname}${window.location.search}`;
@@ -69,6 +70,7 @@ export function App() {
   const pathname = new URL(location, window.location.origin).pathname;
   const isOverview = pathname === "/" || pathname === "/overview";
   const isSources = pathname === "/sources";
+  const isArticles = pathname === "/articles";
 
   return (
     <main className="dashboard-shell">
@@ -85,11 +87,14 @@ export function App() {
       <nav className="primary-nav" aria-label="Main navigation">
         <a href="/overview" aria-current={isOverview ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/overview"); }}>Overview</a>
         <a href="/sources" aria-current={isSources ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/sources"); }}>Sources</a>
+        <a href="/articles" aria-current={isArticles ? "page" : undefined} onClick={(event) => { event.preventDefault(); navigate("/articles"); }}>Articles/Feed</a>
       </nav>
       {isOverview ? (
         <OverviewPage session={session} onNavigate={navigate} />
       ) : isSources ? (
         <SourcesPage session={session} onNavigate={navigate} />
+      ) : isArticles ? (
+        <ArticlesPage session={session} />
       ) : (
         <section className="future-view empty-state" aria-live="polite">
           <p className="eyebrow">Filtered view</p>
