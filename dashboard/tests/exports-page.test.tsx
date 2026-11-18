@@ -150,6 +150,61 @@ describe("Exports and backups page", () => {
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(true);
   });
 
+  it("recovers and cleans up an active session when a successful POST response is malformed", async () => {
+    const requests: Array<{ url: URL; method: string }> = [];
+    let activeCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = urlFrom(input);
+      const method = init?.method ?? "GET";
+      requests.push({ url, method });
+      if (url.pathname === "/v1/exports/active") {
+        activeCalls += 1;
+        return activeCalls === 1 ? jsonResponse({ session: null }) : jsonResponse({ session: SNAPSHOT });
+      }
+      if (url.pathname === "/v1/exports" && method === "POST") return new Response("{malformed", { status: 201 });
+      if (url.pathname === `/v1/exports/${SNAPSHOT.id}` && method === "DELETE") return jsonResponse({ status: "ended" });
+      return jsonResponse({}, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ExportsPage session={createSession()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /i understand.*start backup/i }));
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/new export returned an invalid response/i);
+    expect(requests.map(({ method, url }) => `${method} ${url.pathname}`)).toEqual([
+      "GET /v1/exports/active",
+      "POST /v1/exports",
+      "GET /v1/exports/active",
+      `DELETE /v1/exports/${SNAPSHOT.id}`,
+    ]);
+    expect(screen.getByRole("status").textContent).toContain("Export lock released");
+  });
+
+  it("does not probe or cancel another active session after a rejected concurrent start", async () => {
+    const requests: Array<{ url: URL; method: string }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = urlFrom(input);
+      const method = init?.method ?? "GET";
+      requests.push({ url, method });
+      if (url.pathname === "/v1/exports/active") return jsonResponse({ session: null });
+      if (url.pathname === "/v1/exports" && method === "POST") {
+        return jsonResponse({ error: { code: "export_locked" } }, 423);
+      }
+      return jsonResponse({}, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ExportsPage session={createSession()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /i understand.*start backup/i }));
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/HTTP 423/i);
+    expect(requests.map(({ method, url }) => `${method} ${url.pathname}`)).toEqual([
+      "GET /v1/exports/active",
+      "POST /v1/exports",
+    ]);
+    expect(requests.some(({ method }) => method === "DELETE")).toBe(false);
+  });
+
   it("keeps an incomplete backup unavailable and warns when the expired session cannot be cleaned up", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = urlFrom(input);

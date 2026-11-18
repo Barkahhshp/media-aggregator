@@ -77,6 +77,16 @@ function errorMessage(message: string, status: number): string {
   return `${message} (HTTP ${status})`;
 }
 
+class StartExportError extends Error {
+  readonly recoverActive: boolean;
+
+  constructor(message: string, recoverActive: boolean) {
+    super(message);
+    this.name = "StartExportError";
+    this.recoverActive = recoverActive;
+  }
+}
+
 async function readActiveExport(session: ExportsPageProps["session"]): Promise<ExportSnapshot | null> {
   const response = await apiRequest(session, "/v1/exports/active");
   if (!response.ok) throw new Error(errorMessage("Active export status could not be loaded", response.status));
@@ -96,21 +106,25 @@ async function readActiveExport(session: ExportsPageProps["session"]): Promise<E
 
 async function readStartedSession(session: ExportsPageProps["session"]): Promise<{ id: string; snapshot_id: string; expires_at: number }> {
   const response = await apiRequest(session, "/v1/exports", { method: "POST" });
-  if (!response.ok) throw new Error(errorMessage("A new export could not be started", response.status));
+  if (!response.ok) {
+    // A 423 is an explicit concurrent-start rejection. Its active session belongs
+    // to another tab, so it must never be recovered and deleted here.
+    throw new StartExportError(errorMessage("A new export could not be started", response.status), response.status !== 423);
+  }
   let payload: unknown;
   try {
     payload = await response.json() as unknown;
   } catch {
-    throw new Error("The new export returned an invalid response");
+    throw new StartExportError("The new export returned an invalid response", true);
   }
-  if (!isObject(payload) || !isObject(payload.session)) throw new Error("The new export returned an invalid response");
+  if (!isObject(payload) || !isObject(payload.session)) throw new StartExportError("The new export returned an invalid response", true);
   const value = payload.session;
   if (
     typeof value.id !== "string" || value.id.length === 0 ||
     typeof value.snapshot_id !== "string" || value.snapshot_id.length === 0 ||
     !Number.isSafeInteger(value.expires_at) || Number(value.expires_at) <= 0
   ) {
-    throw new Error("The new export returned incomplete session details");
+    throw new StartExportError("The new export returned incomplete session details", true);
   }
   return { id: value.id, snapshot_id: value.snapshot_id, expires_at: Number(value.expires_at) };
 }
@@ -163,6 +177,22 @@ async function abortPreparedOutput(prepared: PreparedOutput): Promise<void> {
     await prepared.output.writer.abort?.();
   } catch {
     // No server lock has been acquired in this path; preserve the original UI outcome.
+  }
+}
+
+interface StartFailureCleanup {
+  active: ExportSnapshot | null;
+  confirmed: boolean;
+}
+
+async function recoverAndEndStartedExport(session: ExportsPageProps["session"]): Promise<StartFailureCleanup> {
+  try {
+    const active = await readActiveExport(session);
+    if (active === null) return { active: null, confirmed: false };
+    return { active, confirmed: await endExport(session, active.id) };
+  } catch {
+    // Without a correlated ID, do not guess a DELETE target; expiry is the server boundary.
+    return { active: null, confirmed: false };
   }
 }
 
@@ -297,7 +327,24 @@ export function ExportsPage({ session }: ExportsPageProps) {
       started = await readStartedSession(session);
     } catch (error) {
       await abortPreparedOutput(prepared);
-      setTransferError(error instanceof Error ? error.message : "A new export could not be started");
+      const startError = error instanceof StartExportError
+        ? error
+        : new StartExportError(error instanceof Error ? error.message : "A new export could not be started", true);
+      const cleanup = startError.recoverActive
+        ? await recoverAndEndStartedExport(session)
+        : { active: null, confirmed: false };
+      setTransferError(startError.message);
+      if (cleanup.active !== null) {
+        setDisplayedSnapshot({ snapshot_id: cleanup.active.snapshot_id, counts: cleanup.active.counts, expires_at: cleanup.active.expires_at });
+      }
+      setActiveSnapshot(cleanup.confirmed ? null : cleanup.active);
+      setNotice(cleanup.confirmed
+        ? "Export lock released."
+        : startError.recoverActive
+          ? cleanup.active === null
+            ? "Cleanup could not be confirmed; no active session could be safely correlated and the lock may remain until its server-side expiry."
+            : `Cleanup could not be confirmed. The lock may remain until ${expiryLabel(cleanup.active.expires_at).text}.`
+          : "Concurrent start rejected; the other tab's export lock was not changed.");
       setOperation(null);
       return;
     }
