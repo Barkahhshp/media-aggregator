@@ -109,6 +109,33 @@ describe("source management API", () => {
     expect(disabled.source.enabled).toBe(false);
   });
 
+  it("creates_updates_and_clears_feed_article_selector_overrides", async () => {
+    const app = await loadApp();
+    if (!app) return;
+
+    const selectors = { title: "h1", summary: "meta[name='description']", body: ".story-body" };
+    const createdResponse = await sourceRequest(app, "/v1/sources", "POST", {
+      kind: "feed",
+      url: "https://example.com/custom-rss.xml",
+      selectors,
+    });
+    expect(createdResponse.status).toBe(201);
+    const created = await createdResponse.json<{ source: { id: string; selectors: unknown } }>();
+    expect(created.source.selectors).toEqual(selectors);
+
+    const updatedResponse = await sourceRequest(app, `/v1/sources/${created.source.id}`, "PATCH", {
+      selectors: { ...selectors, title: "h2" },
+    });
+    expect(updatedResponse.status).toBe(200);
+    const updated = await updatedResponse.json<{ source: { selectors: unknown } }>();
+    expect(updated.source.selectors).toEqual({ ...selectors, title: "h2" });
+
+    const clearedResponse = await sourceRequest(app, `/v1/sources/${created.source.id}`, "PATCH", { selectors: null });
+    expect(clearedResponse.status).toBe(200);
+    const cleared = await clearedResponse.json<{ source: { selectors: unknown } }>();
+    expect(cleared.source.selectors).toBeNull();
+  });
+
   it("audits_source_creation_configuration_changes_and_disable_without_values", async () => {
     const app = await loadApp();
     if (!app) return;

@@ -145,6 +145,33 @@ describe("Sources page", () => {
     expect(screen.queryByDisplayValue("https://new.example.test/rss?key=private")).toBeNull();
   });
 
+  it("allows_optional_custom_article_selectors_when_creating_a_feed", async () => {
+    const createdSource = sourceFixture({ id: "feed-with-selectors", host: "custom.example.test" });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (methodOf(init) === "POST") return jsonResponse({ source: createdSource }, 201);
+      return jsonResponse({ sources: [] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<SourcesPage session={createSession()} />);
+    await screen.findByText(/no sources configured yet/i);
+    fireEvent.click(screen.getByRole("button", { name: /add source/i }));
+    fireEvent.change(screen.getByLabelText(/source url/i), { target: { value: "https://custom.example.test/rss.xml" } });
+    fireEvent.change(screen.getByLabelText(/selectors json/i), {
+      target: { value: JSON.stringify({ title: "h1", summary: "meta[name='description']", body: ".story-body" }) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /create source/i }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/v1/sources", expect.objectContaining({ method: "POST" })));
+    const [, init] = fetchMock.mock.calls.find(([, request]) => methodOf(request) === "POST") ?? [];
+    expect(JSON.parse(String(init?.body))).toEqual({
+      kind: "feed",
+      url: "https://custom.example.test/rss.xml",
+      poll_interval_sec: 7200,
+      selectors: { title: "h1", summary: "meta[name='description']", body: ".story-body" },
+    });
+  });
+
   it("sends only interval and selector settings for an existing source update", async () => {
     const articleSource = sourceFixture({
       id: "article-source",
@@ -172,6 +199,28 @@ describe("Sources page", () => {
       poll_interval_sec: 7200,
       selectors: { title: "h2", body: "main", summary: "p" },
     });
+  });
+
+  it("clears_a_feed_selector_override_to_restore_the_default_extractors", async () => {
+    const feedSource = sourceFixture({
+      selectors: { title: "h1", body: ".story-body" },
+      last_status: "succeeded",
+    });
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (methodOf(init) === "PATCH") return jsonResponse({ source: { ...feedSource, selectors: null } });
+      return jsonResponse({ sources: [feedSource] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<SourcesPage session={createSession()} />);
+    await screen.findByText("feed.example.test");
+    fireEvent.click(screen.getByRole("button", { name: /edit settings for feed.example.test/i }));
+    fireEvent.change(screen.getByLabelText(/selectors json/i), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/v1/sources/source-123", expect.objectContaining({ method: "PATCH" })));
+    const [, init] = fetchMock.mock.calls.find(([path, request]) => String(path) === "/v1/sources/source-123" && methodOf(request) === "PATCH") ?? [];
+    expect(JSON.parse(String(init?.body))).toEqual({ poll_interval_sec: 3600, selectors: null });
   });
 
   it("disables a source with the existing PATCH contract", async () => {

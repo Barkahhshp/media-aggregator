@@ -6,7 +6,7 @@ import { LoadingError } from "../components/LoadingError";
 import { StatusBadge } from "../components/StatusBadge";
 
 const MIN_POLL_INTERVAL_SECONDS = 900;
-const SELECTOR_SOURCE_KINDS = new Set(["article", "html_list"]);
+const SELECTOR_SOURCE_KINDS = new Set(["feed", "article", "html_list"]);
 
 interface SourceRecord {
   id: string;
@@ -180,7 +180,9 @@ export function SourcesPage({ session, onNavigate }: SourcesPageProps) {
     }
     const body: Record<string, unknown> = { kind, url: urlDraft, poll_interval_sec: interval };
     try {
-      if (SELECTOR_SOURCE_KINDS.has(kind)) body.selectors = parseSelectors(selectorsDraft);
+      if (SELECTOR_SOURCE_KINDS.has(kind) && (kind !== "feed" || selectorsDraft.trim().length > 0)) {
+        body.selectors = parseSelectors(selectorsDraft);
+      }
     } catch (caught) {
       setFormError(caught instanceof Error ? caught.message : "Selectors are invalid");
       return;
@@ -214,7 +216,11 @@ export function SourcesPage({ session, onNavigate }: SourcesPageProps) {
     }
     const body: Record<string, unknown> = { poll_interval_sec: interval };
     try {
-      if (SELECTOR_SOURCE_KINDS.has(source.kind)) body.selectors = parseSelectors(selectorsDraft);
+      if (SELECTOR_SOURCE_KINDS.has(source.kind)) {
+        body.selectors = source.kind === "feed" && selectorsDraft.trim().length === 0
+          ? null
+          : parseSelectors(selectorsDraft);
+      }
     } catch (caught) {
       setFormError(caught instanceof Error ? caught.message : "Selectors are invalid");
       return;
@@ -289,7 +295,7 @@ export function SourcesPage({ session, onNavigate }: SourcesPageProps) {
               </label>
             )}
           </div>
-          <p className="form-note">For article and HTML-list sources, provide selectors as JSON. The URL is used for the request but is not displayed in the source list.</p>
+          <p className="form-note">Feed selectors are optional and override article extraction defaults. Article and HTML-list sources require selectors as JSON; HTML lists also need itemLink. The URL is used for the request but is not displayed in the source list.</p>
           <button type="submit" disabled={busy}>Create source</button>
         </form>
       )}

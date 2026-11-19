@@ -655,6 +655,37 @@ describe("scheduled ingestion", () => {
     expect(JSON.stringify(terminalRows.results)).not.toContain("javascript:");
   });
 
+  it("applies_custom_article_selectors_to_articles_discovered_from_a_feed", async () => {
+    const scheduler = await loadScheduler();
+    if (!scheduler) return;
+    const source = await makeSource("feed", "custom-selectors", 1);
+    await testEnv.DB.prepare("UPDATE sources SET selectors_json = ? WHERE id = ?")
+      .bind(JSON.stringify({ title: "h1", summary: "meta[name='description']", body: ".story-body" }), source.id).run();
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === source.url) {
+        return new Response(feed([{ id: "custom-story", url: "https://example.com/custom-story" }]), {
+          status: 200,
+          headers: { "Content-Type": "application/rss+xml" },
+        });
+      }
+      return new Response('<html><head><meta name="description" content="Feed-specific summary"></head><body><h1>Feed-specific title</h1><div class="story-body"><p>Selected article body.</p></div><article>Wrong default body.</article></body></html>', {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      });
+    }));
+
+    const result = await scheduler.runScheduled(testEnv, 1_000);
+    const article = await testEnv.DB.prepare("SELECT title, summary, content_text FROM articles WHERE source_id = ?")
+      .bind(source.id).first<{ title: string; summary: string | null; content_text: string }>();
+
+    expect(result.stored).toBe(1);
+    expect(article).toEqual({
+      title: "Feed-specific title",
+      summary: "Feed-specific summary",
+      content_text: "Selected article body.",
+    });
+  });
+
   it("respects_Retry_After_and_surfaces_article_HTTP_failures_in_source_and_run_status", async () => {
     const scheduler = await loadScheduler();
     if (!scheduler) return;

@@ -19,7 +19,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validateSelectors(value: unknown, kind: "article" | "html_list"): ArticleSelectors | ApiError {
+function validateSelectors(value: unknown, kind: "article" | "feed" | "html_list"): ArticleSelectors | ApiError {
   if (!isRecord(value)) {
     return error(400, "invalid_selectors", "Selectors must be an object");
   }
@@ -39,7 +39,7 @@ function validateSelectors(value: unknown, kind: "article" | "html_list"): Artic
   if (kind === "html_list" && (typeof value.itemLink !== "string" || value.itemLink.trim().length === 0)) {
     return error(400, "invalid_selectors", "Selector itemLink is required for html_list sources");
   }
-  if (kind === "article" && value.itemLink !== undefined) {
+  if (kind !== "html_list" && value.itemLink !== undefined) {
     return error(400, "invalid_selectors", "Selector itemLink is only supported for html_list sources");
   }
   if (value.itemLink !== undefined && typeof value.itemLink !== "string") {
@@ -119,8 +119,14 @@ export function validateSourceInput(input: unknown): SourceInput | ApiError {
     const checked = validateSelectors(input.selectors, input.kind);
     if (isApiError(checked)) return checked;
     selectors = checked as ArticleSelectors;
+  } else if (input.kind === "feed" && input.selectors !== undefined && input.selectors !== null) {
+    const checked = validateSelectors(input.selectors, "feed");
+    if (isApiError(checked)) return checked;
+    selectors = checked as ArticleSelectors;
+  } else if (input.kind === "feed" && input.selectors === null) {
+    // An explicit null removes a feed override and restores the default selectors.
   } else if (input.selectors !== undefined) {
-    return error(400, "invalid_selectors", "Selectors are only supported for article and html_list sources");
+    return error(400, "invalid_selectors", "Selectors are only supported for feed, article, and html_list sources");
   }
 
   return {

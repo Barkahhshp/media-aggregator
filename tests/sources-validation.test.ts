@@ -60,6 +60,17 @@ describe("source input validation", () => {
       .toMatchObject({ status: 400, code: "invalid_selectors" });
   });
 
+  it("accepts_custom_article_selectors_for_feed_sources_without_itemLink", async () => {
+    const validateSourceInput = await loadValidateSourceInput();
+    if (!validateSourceInput) return;
+
+    const selectors = { title: "h1", summary: "meta[name='description']", body: ".story-body" };
+    expect(validateSourceInput({ kind: "feed", url: "https://example.com/feed.xml", selectors }))
+      .toMatchObject({ kind: "feed", selectors });
+    expect(validateSourceInput({ kind: "feed", url: "https://example.com/feed.xml", selectors: { ...selectors, itemLink: "a.story-link" } }))
+      .toMatchObject({ status: 400, code: "invalid_selectors" });
+  });
+
   it("rejects_itemLink_on_single_article_sources", async () => {
     const validateSourceInput = await loadValidateSourceInput();
     if (!validateSourceInput) return;

@@ -41,6 +41,6 @@ export interface ApiError {
 
 export interface SourcePatchInput {
   poll_interval_sec?: number;
-  selectors?: ArticleSelectors;
+  selectors?: ArticleSelectors | null;
   enabled?: boolean;
 }
