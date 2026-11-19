@@ -33,11 +33,12 @@
   },
   "env": {
     "production": {
+      "name": "media-aggregator",
       "d1_databases": [
         {
           "binding": "DB",
           "database_name": "media-aggregator",
-          "database_id": "00000000-0000-0000-0000-000000000001",
+          "database_id": "7d7ff9d0-72e4-47e9-ad6b-4f80ddf277ab",
           "migrations_dir": "migrations"
         }
       ],
